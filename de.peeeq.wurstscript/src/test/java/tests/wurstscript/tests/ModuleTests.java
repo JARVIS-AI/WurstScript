@@ -295,6 +295,25 @@ public class ModuleTests extends WurstScriptTest {
     }
 
     @Test
+    public void overrideStaticAndActuallyDoStuff() {
+        testAssertOkLines(true,
+            "package Test",
+            "native testSuccess()",
+            "module Test",
+            "    abstract static function foo() returns int",
+            "    static function bar() returns int",
+            "        return foo() * foo()",
+            "class A",
+            "    use Test",
+            "    override static function foo() returns int",
+            "        return 3",
+            "init",
+            "    if A.bar() == 9",
+            "        testSuccess()"
+        );
+    }
+
+    @Test
     public void localInModuleConstructor() {
         testAssertOkLines(false,
                 "package Test",
@@ -564,5 +583,22 @@ public class ModuleTests extends WurstScriptTest {
                 "    let l = new List<A>",
                 "endpackage"
         );
+    }
+
+    @Test
+    public void subclassModuleOnDestroy() {
+        testAssertOkLines(true,
+            "package test",
+            "native testSuccess()",
+            "module OnDestroy",
+            "    ondestroy",
+            "        testSuccess()",
+            "public abstract class A",
+            "public class B extends A",
+            "    use OnDestroy",
+            "init",
+            "    A b = new B()",
+            "    destroy b"
+            );
     }
 }

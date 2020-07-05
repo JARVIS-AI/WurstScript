@@ -29,10 +29,10 @@ public class NameLinks {
         boolean requiresOverrideMod = false;
 
         // errors for functions with same name that it does not override
-        fj.data.List<String> overrideErrors = fj.data.List.nil();
+        io.vavr.collection.List<String> overrideErrors = io.vavr.collection.List.empty();
 
         public void addError(String error) {
-            this.overrideErrors = overrideErrors.cons(error);
+            this.overrideErrors = overrideErrors.prepend(error);
         }
     }
 
@@ -207,7 +207,7 @@ public class NameLinks {
             }
             WPackage importedPackage = imp.attrImportedPackage();
             if (importedPackage == null) {
-                WLogger.info("could not resolve import: " + Utils.printElementWithSource(imp));
+                WLogger.info("could not resolve import: " + Utils.printElementWithSource(Optional.of(imp)));
                 continue;
             }
             if (p.getName().equals("WurstREPL")) {
@@ -327,6 +327,7 @@ public class NameLinks {
         addDefinedNames(result, c, c.getMethods());
         addDefinedNames(result, c, c.getVars());
         addDefinedNames(result, c, c.getModuleInstanciations());
+        addDefinedNames(result, c, c.getInnerClasses());
     }
 
     private static void addDefinedNames(Builder<String, DefLink> result, WScope definedIn, List<? extends NameDef> slots) {

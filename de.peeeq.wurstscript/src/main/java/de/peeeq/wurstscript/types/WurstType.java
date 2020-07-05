@@ -2,10 +2,12 @@ package de.peeeq.wurstscript.types;
 
 import de.peeeq.wurstscript.ast.Element;
 import de.peeeq.wurstscript.attributes.names.FuncLink;
+import de.peeeq.wurstscript.jassIm.ImArrayType;
+import de.peeeq.wurstscript.jassIm.ImArrayTypeMulti;
 import de.peeeq.wurstscript.jassIm.ImExprOpt;
 import de.peeeq.wurstscript.jassIm.ImType;
 import de.peeeq.wurstscript.translation.imtranslation.ImTranslator;
-import fj.data.Option;
+import io.vavr.control.Option;
 import org.eclipse.jdt.annotation.Nullable;
 
 import java.util.List;
@@ -57,9 +59,9 @@ public abstract class WurstType {
 
             if (variablePosition == RIGHT) {
                 Option<WurstTypeBoundTypeParam> bound = mapping.get(tp.getDef());
-                if (bound.isSome()) {
+                if (bound.isDefined()) {
                     // already bound, use current bound
-                    return matchAgainstSupertype(bound.some(), location, mapping, variablePosition);
+                    return matchAgainstSupertype(bound.get(), location, mapping, variablePosition);
                 } else if (mapping.isVar(tp.getDef())) {
                     // match this type parameter
                     return mapping.set(tp.getDef(), new WurstTypeBoundTypeParam(tp.getDef(), this, location));
@@ -252,4 +254,15 @@ public abstract class WurstType {
 
 
     protected abstract boolean isNullable();
+
+    public boolean isArray() {
+        return this instanceof WurstTypeArray;
+    }
+
+    /**
+     * Prints the string as it would be in source code.
+     */
+    public String toPrettyString() {
+        return toString();
+    }
 }

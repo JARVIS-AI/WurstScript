@@ -15,6 +15,20 @@ public class ImPrinter {
             append(sb, "\n");
         }
         append(sb, "\n\n");
+        p.getGlobalInits().forEach((v,es) -> {
+            append(sb, v.getName());
+            append(sb, " = ");
+            boolean first = true;
+            for (ImExpr e : es) {
+                if (!first) {
+                    append(sb, ", ");
+                }
+                e.print(sb, indent);
+                first = false;
+            }
+            append(sb, "\n");
+        });
+        append(sb, "\n\n");
         for (ImFunction f : p.getFunctions()) {
             f.print(sb, indent);
             append(sb, "\n");
@@ -172,7 +186,7 @@ public class ImPrinter {
     public static void print(ImIf p, Appendable sb, int indent) {
         append(sb, "if ");
         p.getCondition().print(sb, indent);
-        append(sb, "{\n");
+        append(sb, " {\n");
         p.getThenBlock().print(sb, indent + 1);
         indent(sb, indent);
         append(sb, "} else {\n");
@@ -227,6 +241,9 @@ public class ImPrinter {
 
 
     public static void print(ImFunctionCall p, Appendable sb, int indent) {
+        if (p.getCallType() == CallType.EXECUTE) {
+            append(sb, "EXECUTE ");
+        }
         append(sb, p.getFunc().getName());
         append(sb, smallHash(p.getFunc()));
         printTypeArguments(p.getTypeArguments(), indent, sb);
@@ -559,5 +576,9 @@ public class ImPrinter {
         append(sb, " castTo ");
         e.getToType().print(sb, indent);
         append(sb, ")");
+    }
+
+    public static void print(ImAnyType at, Appendable sb, int indent) {
+        append(sb, "any");
     }
 }

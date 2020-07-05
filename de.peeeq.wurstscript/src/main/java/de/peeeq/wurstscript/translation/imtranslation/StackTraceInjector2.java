@@ -11,6 +11,8 @@ import de.peeeq.wurstscript.WurstOperator;
 import de.peeeq.wurstscript.ast.FuncDef;
 import de.peeeq.wurstscript.ast.FunctionDefinition;
 import de.peeeq.wurstscript.ast.NameDef;
+import de.peeeq.wurstscript.ast.WurstModel;
+import de.peeeq.wurstscript.attributes.CompileError;
 import de.peeeq.wurstscript.jassIm.*;
 import de.peeeq.wurstscript.parser.WPos;
 import de.peeeq.wurstscript.types.TypesHelper;
@@ -19,6 +21,8 @@ import org.eclipse.jdt.annotation.Nullable;
 
 import java.util.*;
 import java.util.Map.Entry;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * Takes a program and inserts stack traces at error messages
@@ -26,13 +30,16 @@ import java.util.Map.Entry;
 public class StackTraceInjector2 {
 
     private static final int MAX_STACKTRACE_SIZE = 20;
+    public static final String STACK_POS_PARAM = "__wurst_stackPos";
     private ImProg prog;
+    private ImTranslator tr;
     private ImVar stackSize;
     private ImVar stack;
     private ImGetStackTrace dummyGetStackTrace = JassIm.ImGetStackTrace();
 
-    public StackTraceInjector2(ImProg prog, ImTranslator imTranslator2) {
+    public StackTraceInjector2(ImProg prog, ImTranslator tr) {
         this.prog = prog;
+        this.tr = tr;
     }
 
     public void transform(TimeTaker timeTaker) {
@@ -40,7 +47,7 @@ public class StackTraceInjector2 {
         final Multimap<ImFunction, ImFunctionCall> calls = LinkedListMultimap.create();
         // called function -> calling function
         final Multimap<ImFunction, ImFunction> callRelation = LinkedListMultimap.create();
-        final List<ImFuncRef> funcRefs = Lists.newArrayList();
+        final List<ImFuncRefOrCall> funcRefs = Lists.newArrayList();
         prog.accept(new ImProg.DefaultVisitor() {
 
             @Override
@@ -60,9 +67,14 @@ public class StackTraceInjector2 {
             @Override
             public void visit(ImFunctionCall c) {
                 super.visit(c);
-                calls.put(c.getFunc(), c);
-                ImFunction caller = c.getNearestFunc();
-                callRelation.put(c.getFunc(), caller);
+                if (c.getCallType() == CallType.EXECUTE) {
+                    // ExecuteFunc can be handled like a funcref
+                    funcRefs.add(c);
+                } else {
+                    calls.put(c.getFunc(), c);
+                    ImFunction caller = c.getNearestFunc();
+                    callRelation.put(c.getFunc(), caller);
+                }
             }
 
             @Override
@@ -84,15 +96,49 @@ public class StackTraceInjector2 {
 
         // find affected functions
         Set<ImFunction> affectedFuncs = Sets.newHashSet(stackTraceGets.keySet());
-        for (ImFunction stackTraceUse : stackTraceGets.keys()) {
-            callRelationTr.get(stackTraceUse).forEach(affectedFuncs::add);
+
+        if (tr.isLuaTarget()) {
+            // in Lua all functions are potentially affected, because we don't know where Lua might crash
+            Stream.concat(
+                prog.getFunctions().stream(),
+                prog.getClasses().stream().flatMap(c -> c.getFunctions().stream()))
+                .filter((ImFunction f) ->
+                    !f.hasFlag(FunctionFlagEnum.IS_NATIVE)
+                        && !f.hasFlag(FunctionFlagEnum.IS_BJ)
+                        && !f.hasFlag(FunctionFlagEnum.IS_EXTERN))
+                .collect(Collectors.toCollection(() -> affectedFuncs));
+
+        } else {
+            for (ImFunction stackTraceUse : stackTraceGets.keys()) {
+                callRelationTr.get(stackTraceUse).forEach(affectedFuncs::add);
+            }
         }
+
 
         passStacktraceParams(calls, affectedFuncs);
         addStackTracePush(calls, affectedFuncs);
         addStackTracePop(affectedFuncs);
         rewriteFuncRefs(funcRefs, affectedFuncs);
         rewriteErrorStatements(stackTraceGets);
+        rewriteMethodCalls(affectedFuncs);
+
+    }
+
+    private void rewriteMethodCalls(Set<ImFunction> affectedFuncs) {
+        if (!tr.isLuaTarget()) {
+            return;
+        }
+        // for lua, also add stack traces to method calls
+        prog.accept(new Element.DefaultVisitor() {
+            @Override
+            public void visit(ImMethodCall call) {
+                super.visit(call);
+                if (affectedFuncs.contains(call.getMethod().getImplementation())) {
+                    String callPos = getCallPos(call.attrTrace().attrErrorPos());
+                    call.getArguments().add(getStacktraceIndex(call), str("when calling " + name(call.getMethod()) + "" + callPos));
+                }
+            }
+        });
 
     }
 
@@ -112,7 +158,11 @@ public class StackTraceInjector2 {
     }
 
     private ImExpr getStackPosVar(ImFunction f) {
-        return JassIm.ImVarAccess(Utils.getLast(f.getParameters()));
+        return JassIm.ImVarAccess(f.getParameters().stream()
+            .filter(this::isStackTraceParam)
+            .findFirst().orElseGet(() -> {
+                throw new CompileError(f, "Function " + f.getName() + " has no stacktrace parameter.");
+            }));
     }
 
     /**
@@ -133,6 +183,7 @@ public class StackTraceInjector2 {
                 }
             });
 
+            int count = 0;
             for (ImReturn ret : returns) {
                 ImStmts stmts = JassIm.ImStmts();
                 ImReturn newReturn;
@@ -143,7 +194,12 @@ public class StackTraceInjector2 {
                     newReturn = JassIm.ImReturn(trace, returnedValue);
                 } else {
                     // temp = result
-                    ImVar temp = JassIm.ImVar(trace, f.getReturnType(), "stackTrace_tempReturn", false);
+                    String tempReturnName = "stackTrace_tempReturn";
+                    count++;
+                    if (count > 1) {
+                        tempReturnName += "_" + count;
+                    }
+                    ImVar temp = JassIm.ImVar(trace, f.getReturnType(), tempReturnName, false);
                     f.getLocals().add(temp);
                     stmts.add(JassIm.ImSet(trace, JassIm.ImVarAccess(temp), (ImExpr) returnedValue));
                     newReturn = JassIm.ImReturn(trace, JassIm.ImVarAccess(temp));
@@ -170,7 +226,7 @@ public class StackTraceInjector2 {
             } else if (v instanceof ImIf) {
                 ImIf imIf = (ImIf) v;
                 if (returnsOnAllPaths(imIf.getThenBlock())
-                        && returnsOnAllPaths(imIf.getElseBlock())) {
+                    && returnsOnAllPaths(imIf.getElseBlock())) {
                     return true;
                 }
             } else if (v instanceof ImStatementExpr) {
@@ -214,16 +270,55 @@ public class StackTraceInjector2 {
             }
             Collection<ImFunctionCall> callsForF = calls.get(f);
             // add stackPos parameter
-            f.getParameters().add(JassIm.ImVar(f.getTrace(), TypesHelper.imString(), "stackPos", false));
+
+            f.getParameters().add(getStacktraceIndex(f), JassIm.ImVar(f.getTrace(), TypesHelper.imString(), STACK_POS_PARAM, false));
             // pass the stacktrace parameter at all calls
             for (ImFunctionCall call : callsForF) {
                 String callPos = getCallPos(call.attrTrace().attrErrorPos());
-                call.getArguments().add(str("when calling " + name(f) + "" + callPos));
+                call.getArguments().add(getStacktraceIndex(call), str("when calling " + name(f) + "" + callPos));
             }
         }
     }
 
-    private String name(ImFunction f) {
+    /**
+     * insert stacktrace parameter at the end, for vararg functions at the second last position
+     */
+    private int getStacktraceIndex(ImFunction f) {
+        if (f.hasFlag(FunctionFlagEnum.IS_VARARG)) {
+            return f.getParameters().size() - 1;
+        }
+        return f.getParameters().size();
+    }
+
+    /**
+     * insert stacktrace parameter at the end, for vararg functions at the second last position
+     */
+    private int getStacktraceIndex(ImFunctionCall c) {
+        ImFunction f = c.getFunc();
+        int res = f.getParameters().size() - 1;
+        if (f.hasFlag(FunctionFlagEnum.IS_VARARG)) {
+            res--;
+        }
+        if (res < 0 || res > c.getArguments().size() + 1) {
+            throw new CompileError(c, "Call " + c + " invalid index " + res + " for parameters " + f.getParameters() + " and isVararg = " + f.hasFlag(FunctionFlagEnum.IS_VARARG));
+        }
+        return res;
+    }
+
+    private int getStacktraceIndex(ImMethodCall c) {
+        ImFunction f = c.getMethod().getImplementation();
+        int res = f.getParameters().size() - 2; // subtract one for implicit parameter
+        if (f.hasFlag(FunctionFlagEnum.IS_VARARG)) {
+            res--;
+        }
+        if (res < 0 || res > c.getArguments().size() + 1) {
+            throw new CompileError(c, "Call " + c + " invalid index " + res + " for parameters " + f.getParameters() + " and isVararg = " + f.hasFlag(FunctionFlagEnum.IS_VARARG));
+        }
+        return res;
+    }
+
+
+    private String name(JassImElementWithName f) {
         @Nullable NameDef nameDef = f.attrTrace().tryGetNameDef();
         if (nameDef instanceof FunctionDefinition) {
             return nameDef.getName();
@@ -249,9 +344,9 @@ public class StackTraceInjector2 {
         return JassIm.ImSet(trace, JassIm.ImVarAccess(v), JassIm.ImOperatorCall(WurstOperator.MINUS, JassIm.ImExprs(JassIm.ImVarAccess(v), JassIm.ImIntVal(1))));
     }
 
-    private void rewriteFuncRefs(final List<ImFuncRef> funcRefs, Set<ImFunction> affectedFuncs) {
+    private void rewriteFuncRefs(final List<ImFuncRefOrCall> funcRefs, Set<ImFunction> affectedFuncs) {
         // rewrite funcrefs
-        for (ImFuncRef fr : funcRefs) {
+        for (ImFuncRefOrCall fr : funcRefs) {
             ImFunction f = fr.getFunc();
             if (!affectedFuncs.contains(f)) {
                 continue;
@@ -259,32 +354,59 @@ public class StackTraceInjector2 {
 
             ImVars params = f.getParameters().copy();
             // remove stacktrace param
-            params.remove(params.size() - 1);
+            params.removeIf(this::isStackTraceParam);
 
             ImFunction bridgeFunc = JassIm.ImFunction(f.getTrace(), "bridge_" + f.getName(), JassIm.ImTypeVars(), params, f.getReturnType().copy(), JassIm.ImVars(), JassIm.ImStmts(), f.getFlags());
             prog.getFunctions().add(bridgeFunc);
 
             ImStmt stmt;
-            ImExpr str = str(fr.attrTrace().attrSource().printShort());
+            de.peeeq.wurstscript.ast.Element frTrace = fr.attrTrace();
+
+            String msg = "";
+            if (fr instanceof ImFuncRef) {
+                msg = "via function reference";
+            } else {
+                msg = "via ExecuteFunc";
+            }
+            if (frTrace instanceof WurstModel) {
+                ImFunction frEnclosingFunc = getEnclosingFunc(fr);
+                if (frEnclosingFunc != null) {
+                    msg += " in function " + frEnclosingFunc.getName();
+                }
+            } else {
+                msg += " " +frTrace.attrSource().printShort();
+            }
+            ImExpr str = str(msg);
             ImExprs args = JassIm.ImExprs(str);
             ImStmts body = bridgeFunc.getBody();
-            de.peeeq.wurstscript.ast.Element trace = fr.attrTrace();
-            if (trace.getParent() == null) {
-                throw new RuntimeException("func ref " + fr + " has no trace: " + trace);
-            }
+            de.peeeq.wurstscript.ast.Element trace = frTrace;
             // reset stack and add information for callback:
             body.add(JassIm.ImSet(trace, JassIm.ImVarAccess(stackSize), JassIm.ImIntVal(0)));
 
-            ImFunctionCall call = JassIm.ImFunctionCall(fr.attrTrace(), f, JassIm.ImTypeArguments(), args, true, CallType.NORMAL);
+            ImFunctionCall call = JassIm.ImFunctionCall(frTrace, f, JassIm.ImTypeArguments(), args, true, CallType.NORMAL);
             if (bridgeFunc.getReturnType() instanceof ImVoid) {
                 stmt = call;
             } else {
-                stmt = JassIm.ImReturn(fr.attrTrace(), call);
+                stmt = JassIm.ImReturn(frTrace, call);
             }
             body.add(stmt);
 
             fr.setFunc(bridgeFunc);
         }
+    }
+
+    private ImFunction getEnclosingFunc(Element e) {
+        while (e != null) {
+            if (e instanceof ImFunction) {
+                return (ImFunction) e;
+            }
+            e = e.getParent();
+        }
+        return null;
+    }
+
+    private boolean isStackTraceParam(ImVar p) {
+        return p.getName().equals(STACK_POS_PARAM);
     }
 
     private void rewriteErrorStatements(final Multimap<ImFunction, ImGetStackTrace> stackTraceGets) {
@@ -315,15 +437,15 @@ public class StackTraceInjector2 {
             loopBody.add(increment(trace, traceLimit));
             // exitwhen limit > 20
             loopBody.add(JassIm.ImExitwhen(trace, JassIm.ImOperatorCall(WurstOperator.GREATER,
-                    JassIm.ImExprs(JassIm.ImVarAccess(traceLimit), JassIm.ImIntVal(MAX_STACKTRACE_SIZE)))));
+                JassIm.ImExprs(JassIm.ImVarAccess(traceLimit), JassIm.ImIntVal(MAX_STACKTRACE_SIZE)))));
             // exitwhen i < 0
             loopBody.add(JassIm.ImExitwhen(trace, JassIm.ImOperatorCall(WurstOperator.LESS,
-                    JassIm.ImExprs(JassIm.ImVarAccess(traceI), JassIm.ImIntVal(0)))));
+                JassIm.ImExprs(JassIm.ImVarAccess(traceI), JassIm.ImIntVal(0)))));
             // s = s + "\n " + stack[i]
             loopBody.add(JassIm.ImSet(trace, JassIm.ImVarAccess(traceStr), JassIm.ImOperatorCall(WurstOperator.PLUS,
-                    JassIm.ImExprs(JassIm.ImVarAccess(traceStr),
-                            JassIm.ImOperatorCall(WurstOperator.PLUS, JassIm.ImExprs(JassIm.ImStringVal("\n   "),
-                                    JassIm.ImVarArrayAccess(trace, stack, JassIm.ImExprs((ImExpr) JassIm.ImVarAccess(traceI)))))))));
+                JassIm.ImExprs(JassIm.ImVarAccess(traceStr),
+                    JassIm.ImOperatorCall(WurstOperator.PLUS, JassIm.ImExprs(JassIm.ImStringVal("\n   "),
+                        JassIm.ImVarArrayAccess(trace, stack, JassIm.ImExprs((ImExpr) JassIm.ImVarAccess(traceI)))))))));
 
             s.replaceBy(JassIm.ImStatementExpr(stmts, JassIm.ImVarAccess(traceStr)));
         }

@@ -6,6 +6,7 @@ import de.peeeq.wurstscript.ast.*;
 import de.peeeq.wurstscript.ast.Element;
 import de.peeeq.wurstscript.attributes.CompileError;
 import de.peeeq.wurstscript.attributes.names.NameLink;
+import de.peeeq.wurstscript.attributes.names.OtherLink;
 import de.peeeq.wurstscript.jassIm.ImClass;
 import de.peeeq.wurstscript.jassIm.*;
 import de.peeeq.wurstscript.jassIm.ImExprs;
@@ -15,12 +16,13 @@ import de.peeeq.wurstscript.jassIm.ImStmts;
 import de.peeeq.wurstscript.jassIm.ImVar;
 import de.peeeq.wurstscript.types.*;
 import de.peeeq.wurstscript.utils.Utils;
-import fj.data.Either;
-import fj.data.Option;
+import io.vavr.control.Either;
+import io.vavr.control.Option;
 
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static de.peeeq.wurstscript.jassIm.JassIm.*;
 
@@ -97,6 +99,12 @@ public class ExprTranslation {
     }
 
     static ImExpr wrapTranslation(Element trace, ImTranslator t, ImExpr translated, WurstType actualType, WurstType expectedTypRaw) {
+        if (t.isLuaTarget()) {
+            // for lua we do not need fromIndex/toIndex
+            return translated;
+        }
+
+
         ImFunction toIndex = null;
         ImFunction fromIndex = null;
         if (actualType instanceof WurstTypeBoundTypeParam) {
@@ -142,7 +150,7 @@ public class ExprTranslation {
             return ImFunctionCall(e, calledFunc, ImTypeArguments(), ImExprs(left, right), false, CallType.NORMAL);
         }
         if (op == WurstOperator.DIV_REAL) {
-            if (Utils.isJassCode(e)) {
+            if (Utils.isJassCode(Optional.of(e))) {
                 if (e.getLeft().attrTyp().isSubtypeOf(WurstTypeInt.instance(), e)
                         && e.getRight().attrTyp().isSubtypeOf(WurstTypeInt.instance(), e)) {
                     // in jass when we have int1 / int2 this actually means int1
@@ -187,9 +195,7 @@ public class ExprTranslation {
 
     public static ImExpr translateIntern(ExprNull e, ImTranslator t, ImFunction f) {
         WurstType expectedTypeRaw = e.attrExpectedTypRaw();
-        if (expectedTypeRaw.isTranslatedToInt()) {
-            return ImIntVal(0);
-        } else if (expectedTypeRaw instanceof WurstTypeUnknown) {
+        if (expectedTypeRaw instanceof WurstTypeUnknown) {
             e.addError("Cannot use 'null' in this context.");
         }
         return ImNull(expectedTypeRaw.imTranslateType(t));
@@ -218,7 +224,8 @@ public class ExprTranslation {
     }
 
     private static ImExpr translateNameDef(NameRef e, ImTranslator t, ImFunction f) throws CompileError {
-        NameDef decl = e.attrNameDef();
+        NameLink link = e.attrNameLink();
+        NameDef decl = link == null ? null : link.getDef();
         if (decl == null) {
             // should only happen with gg_ variables
             if (!t.isEclipseMode()) {
@@ -274,6 +281,9 @@ public class ExprTranslation {
             EnumMember enumMember = (EnumMember) decl;
             int id = t.getEnumMemberId(enumMember);
             return ImIntVal(id);
+        } else if (link instanceof OtherLink) {
+            OtherLink otherLink = (OtherLink) link;
+            return otherLink.translate(e, t, f);
         } else {
             throw new CompileError(e.getSource(), "Cannot translate reference to " + Utils.printElement(decl));
         }
@@ -529,10 +539,10 @@ public class ExprTranslation {
         for (ImTypeVar tv : typeVariables) {
             TypeParamDef tp = tr.getTypeParamDef(tv);
             Option<WurstTypeBoundTypeParam> to = mapping.get(tp);
-            if (to.isNone()) {
+            if (to.isEmpty()) {
                 throw new CompileError(location, "Type variable " + tp.getName() + " not bound in mapping.");
             }
-            WurstTypeBoundTypeParam t = to.some();
+            WurstTypeBoundTypeParam t = to.get();
             if (!t.isTemplateTypeParameter()) {
                 continue;
             }

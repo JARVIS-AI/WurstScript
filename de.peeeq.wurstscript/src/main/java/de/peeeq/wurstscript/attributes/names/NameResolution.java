@@ -4,12 +4,17 @@ import com.google.common.collect.ImmutableCollection;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import de.peeeq.wurstscript.ast.*;
+import de.peeeq.wurstscript.jassIm.ImExpr;
+import de.peeeq.wurstscript.jassIm.ImFunction;
+import de.peeeq.wurstscript.jassIm.JassIm;
+import de.peeeq.wurstscript.translation.imtranslation.ImTranslator;
 import de.peeeq.wurstscript.types.*;
 import de.peeeq.wurstscript.utils.Utils;
 import org.eclipse.jdt.annotation.Nullable;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 public class NameResolution {
 
@@ -113,7 +118,7 @@ public class NameResolution {
             if (scope instanceof LoopStatementWithVarDef) {
                 LoopStatementWithVarDef loop = (LoopStatementWithVarDef) scope;
                 // only consider this scope if node is in the body:
-                if (!Utils.elementContained(node, loop.getBody())) {
+                if (!Utils.elementContained(Optional.of(node), loop.getBody())) {
                     continue;
                 }
             }
@@ -157,8 +162,8 @@ public class NameResolution {
             if (privateCandidate == null) {
                 node.addError("Could not find variable " + name + ".");
             } else {
-                node.addError(Utils.printElementWithSource(privateCandidate.getDef()) + " is not visible inside this package." +
-                        " If you want to access it, declare it public.");
+                node.addError(Utils.printElementWithSource(Optional.of(privateCandidate.getDef()))
+                        + " is not visible inside this package. If you want to access it, declare it public.");
                 return privateCandidate;
             }
         }
@@ -183,11 +188,23 @@ public class NameResolution {
         if (receiverType instanceof WurstTypeClassOrInterface) {
             WurstTypeClassOrInterface ct = (WurstTypeClassOrInterface) receiverType;
             for (DefLink n : ct.nameLinks().get(name)) {
-                if (n instanceof VarLink) {
+                if (n instanceof VarLink || n instanceof TypeDefLink) {
                     if (n.getVisibility().isPublic()) {
                         return n;
                     }
                 }
+            }
+        } else if (receiverType instanceof WurstTypeArray && name.equals("length")) {
+            // special lookup for length
+            WurstTypeArray wta = (WurstTypeArray) receiverType;
+            if (wta.getDimensions() > 0) {
+                int size = wta.getSize(0);
+                return new OtherLink(Visibility.PUBLIC, name, WurstTypeInt.instance()) {
+                    @Override
+                    public ImExpr translate(NameRef e, ImTranslator t, ImFunction f) {
+                        return JassIm.ImIntVal(size);
+                    }
+                };
             }
         }
 
@@ -199,7 +216,7 @@ public class NameResolution {
         if (n_receiverType == null) {
             return null;
         }
-        VariableBinding mapping = receiverType.matchAgainstSupertype(n_receiverType, node, VariableBinding.emptyMapping().withTypeVariables(fj.data.List.iterableList(n.getTypeParams())), VariablePosition.RIGHT);
+        VariableBinding mapping = receiverType.matchAgainstSupertype(n_receiverType, node, VariableBinding.emptyMapping().withTypeVariables(n.getTypeParams()), VariablePosition.RIGHT);
         if (mapping == null) {
             return null;
         }
@@ -244,8 +261,8 @@ public class NameResolution {
             if (privateCandidate == null) {
                 node.addError("Could not find type " + name + ".");
             } else {
-                node.addError(Utils.printElementWithSource(privateCandidate.getDef()) + " is not visible inside this package." +
-                        " If you want to access it, declare it public.");
+                node.addError(Utils.printElementWithSource(Optional.of(privateCandidate.getDef()))
+                        + " is not visible inside this package. If you want to access it, declare it public.");
                 return (TypeDef) privateCandidate.getDef();
             }
         }

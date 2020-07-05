@@ -5,6 +5,8 @@ import com.google.common.collect.*;
 import com.google.common.collect.ImmutableList.Builder;
 import de.peeeq.datastructures.Partitions;
 import de.peeeq.datastructures.TransitiveClosure;
+import de.peeeq.wurstio.utils.FileUtils;
+import de.peeeq.wurstscript.RunArgs;
 import de.peeeq.wurstscript.WLogger;
 import de.peeeq.wurstscript.WurstOperator;
 import de.peeeq.wurstscript.ast.*;
@@ -13,7 +15,6 @@ import de.peeeq.wurstscript.attributes.names.FuncLink;
 import de.peeeq.wurstscript.attributes.names.NameLink;
 import de.peeeq.wurstscript.attributes.names.PackageLink;
 import de.peeeq.wurstscript.jassIm.Element;
-import de.peeeq.wurstscript.jassIm.*;
 import de.peeeq.wurstscript.jassIm.ImArrayType;
 import de.peeeq.wurstscript.jassIm.ImArrayTypeMulti;
 import de.peeeq.wurstscript.jassIm.ImClass;
@@ -35,6 +36,7 @@ import de.peeeq.wurstscript.jassIm.ImTypeVars;
 import de.peeeq.wurstscript.jassIm.ImVar;
 import de.peeeq.wurstscript.jassIm.ImVars;
 import de.peeeq.wurstscript.jassIm.ImVoid;
+import de.peeeq.wurstscript.jassIm.*;
 import de.peeeq.wurstscript.parser.WPos;
 import de.peeeq.wurstscript.types.*;
 import de.peeeq.wurstscript.utils.Pair;
@@ -99,12 +101,14 @@ public class ImTranslator {
 
     de.peeeq.wurstscript.ast.Element lasttranslatedThing;
     private boolean debug = false;
+    private final RunArgs runArgs;
 
-    public ImTranslator(WurstModel wurstProg, boolean isUnitTestMode) {
+    public ImTranslator(WurstModel wurstProg, boolean isUnitTestMode, RunArgs runArgs) {
         this.wurstProg = wurstProg;
         this.lasttranslatedThing = wurstProg;
         this.isUnitTestMode = isUnitTestMode;
         imProg = ImProg(wurstProg, ImVars(), ImFunctions(), ImMethods(), JassIm.ImClasses(), JassIm.ImTypeClassFuncs(), new LinkedHashMap<>());
+        this.runArgs = runArgs;
     }
 
 
@@ -141,9 +145,11 @@ public class ImTranslator {
             throw t;
         } catch (Throwable t) {
             WLogger.severe(t);
-            throw new RuntimeException("There was a Wurst bug in the translation of " + Utils.printElementWithSource(lasttranslatedThing) + ": " + t
-                    .getMessage() +
-                    "\nPlease open a ticket with source code and the error log.", t);
+            throw new RuntimeException("There was a Wurst bug in the translation of "
+                    + Utils.printElementWithSource(Optional.of(lasttranslatedThing))
+                    + ": "
+                    + t.getMessage()
+                    + "\nPlease open a ticket with source code and the error log.", t);
         }
     }
 
@@ -438,13 +444,7 @@ public class ImTranslator {
                 )),
                 // then: DisplayTimedTextToPlayer(GetLocalPlayer(), 0., 0., 45., "Could not initialize package")
                 JassIm.ImStmts(
-                        ImFunctionCall(trace, native_DisplayTimedTextToPlayer, ImTypeArguments(), JassIm.ImExprs(
-                                ImFunctionCall(trace, native_GetLocalPlayer, ImTypeArguments(), JassIm.ImExprs(), false, CallType.NORMAL),
-                                JassIm.ImRealVal("0."),
-                                JassIm.ImRealVal("0."),
-                                JassIm.ImRealVal("45."),
-                                JassIm.ImStringVal("Could not initialize package " + p.getName() + ".")
-                        ), false, CallType.NORMAL)
+                    imError(trace, JassIm.ImStringVal("Could not initialize package " + p.getName() + "."))
                 ),
                 // else:
                 JassIm.ImStmts()));
@@ -524,6 +524,8 @@ public class ImTranslator {
         if (type instanceof ImSimpleType) {
             ImSimpleType imSimpleType = (ImSimpleType) type;
             return ImHelper.defaultValueForType(imSimpleType);
+        } else if (type instanceof ImAnyType) {
+            return JassIm.ImIntVal(0);
         } else if (type instanceof ImTupleType) {
             ImTupleType imTupleType = (ImTupleType) type;
             return getDefaultValueForJassType(imTupleType.getTypes().get(0));
@@ -833,7 +835,7 @@ public class ImTranslator {
 
     private boolean isBJ(WPos source) {
         String f = source.getFile().toLowerCase();
-        return f.endsWith("blizzard.j") || f.endsWith("common.j");
+        return f.endsWith("blizzard.j") || f.endsWith("common.j") || FileUtils.getWPosParent(source).equals("jassdoc");
     }
 
     public ImFunction getInitFuncFor(WPackage p) {
@@ -1077,7 +1079,10 @@ public class ImTranslator {
                 }
             }
             if (funcNameLink == null) {
-                throw new Error("Could not find " + Utils.printElementWithSource(func) + " in " + Utils.printElementWithSource(c));
+                throw new Error("Could not find "
+                    + Utils.printElementWithSource(Optional.of(func))
+                    + " in "
+                    + Utils.printElementWithSource(Optional.of(c)));
             }
             for (NameLink nameLink : c.attrNameLinks().get(func.getName())) {
                 NameDef nameDef = nameLink.getDef();
@@ -1086,7 +1091,7 @@ public class ImTranslator {
                         FuncLink funcLink = (FuncLink) nameLink;
                         FuncDef f = (FuncDef) funcLink.getDef();
                         // check if function f overrides func
-                        if (WurstValidator.canOverride(funcLink, funcNameLink)) {
+                        if (WurstValidator.canOverride(funcLink, funcNameLink, false)) {
                             result.put(c, f);
                         }
                     }
@@ -1105,7 +1110,7 @@ public class ImTranslator {
     }
 
 
-    Map<ConstructorDef, ImFunction> constructorFuncs = Maps.newLinkedHashMap();
+    private Map<ConstructorDef, ImFunction> constructorFuncs = Maps.newLinkedHashMap();
 
     public ImFunction getConstructFunc(ConstructorDef constr) {
         ImFunction f = constructorFuncs.get(constr);
@@ -1276,6 +1281,10 @@ public class ImTranslator {
         return typeVariable.getFor(tv);
     }
 
+    public boolean isLuaTarget() {
+        return runArgs.isLua();
+    }
+
 
     interface VarsForTupleResult {
 
@@ -1421,6 +1430,12 @@ public class ImTranslator {
             @Override
             public VarsForTupleResult case_ImSimpleType(ImSimpleType st) {
                 ImType type = typeConstructor.apply(st);
+                return new SingleVarResult(JassIm.ImVar(tr, type, name, false));
+            }
+
+            @Override
+            public VarsForTupleResult case_ImAnyType(ImAnyType at) {
+                ImType type = typeConstructor.apply(at);
                 return new SingleVarResult(JassIm.ImVar(tr, type, name, false));
             }
 
@@ -1642,22 +1657,31 @@ public class ImTranslator {
         ImStmts body = JassIm.ImStmts();
 
         // print message:
-        body.add(ImFunctionCall(emptyTrace, getDebugPrintFunction(), ImTypeArguments(), JassIm.ImExprs(JassIm.ImVarAccess(msgVar)), false, CallType.NORMAL));
+        // msg = msg + stacktrace
+        ImExpr msg = JassIm.ImOperatorCall(WurstOperator.PLUS, ImExprs(JassIm.ImVarAccess(msgVar),
+            JassIm.ImOperatorCall(WurstOperator.PLUS,
+                ImExprs(
+                    JassIm.ImStringVal("\n"),
+                    JassIm.ImGetStackTrace()))));
+
+        body.add(ImFunctionCall(emptyTrace, getDebugPrintFunction(), ImTypeArguments(), JassIm.ImExprs(msg), false, CallType.NORMAL));
         // TODO divide by zero to crash thread:
 
 
-//		stmts.add(JassAst.JassStmtCall("BJDebugMsg", 
+//		stmts.add(JassAst.JassStmtCall("BJDebugMsg",
 //				JassAst.JassExprlist(JassAst.JassExprBinary(
-//						JassAst.JassExprStringVal("|cffFF3A29Wurst Error:|r" + nl), 
+//						JassAst.JassExprStringVal("|cffFF3A29Wurst Error:|r" + nl),
 //						JassAst.JassOpPlus(),
 //						s.getMessage().translate(translator)))));
 //		// crash thread (divide by zero)
 //		stmts.add(JassAst.JassStmtCall("I2S", JassAst.JassExprlist(JassAst.JassExprBinary(JassAst.JassExprIntVal("1"), JassAst.JassOpDiv(), Jas
-//				               
+//
 
         List<FunctionFlag> flags = Lists.newArrayList();
 
-        return ImFunction(emptyTrace, "error", ImTypeVars(), parameters, returnType, locals, body, flags);
+        ImFunction errorFunc = ImFunction(emptyTrace, "error", ImTypeVars(), parameters, returnType, locals, body, flags);
+        imProg.getFunctions().add(errorFunc);
+        return errorFunc;
     }
 
 
@@ -1680,5 +1704,7 @@ public class ImTranslator {
         return compiletimeExpressionsOrder.getOrDefault(fc, 0);
     }
 
-
+    public RunArgs getRunArgs() {
+        return runArgs;
+    }
 }

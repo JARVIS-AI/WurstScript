@@ -604,6 +604,7 @@ public class ClosureTests extends WurstScriptTest {
     @Test
     public void testDispatch() {
         test().executeProg(true)
+            .testLua(false)
                 .executeProgOnlyAfterTransforms()
                 .lines(
                 "package A",
@@ -703,7 +704,7 @@ public class ClosureTests extends WurstScriptTest {
 
     @Test
     public void overload1() {
-        testAssertErrorsLines(true, "Could not infer type for parameter x. The target type could not be uniquely determined",
+        testAssertErrorsLines(true, "No operator overloading function for operator + was found for operands (integer or string) and integer-literal.",
                 "package A",
                 "   native testSuccess()",
                 "   interface Func",
@@ -822,6 +823,42 @@ public class ClosureTests extends WurstScriptTest {
                 "	SimpleFunc f = (int x) -> x + main",
                 "	if f.apply(3) == 7",
                 "		testSuccess()"
+        );
+    }
+
+
+    @Test
+    public void closureInClassInit() {
+        testAssertOkLines(true,
+            "package test",
+            "native testSuccess()",
+            "interface Func",
+            "	function apply(int x) returns int",
+            "class A",
+            "	Func f = x -> x + 1",
+            "	construct()",
+            "	construct(int x)",
+            "init",
+            "	let a = new A",
+            "	if a.f.apply(3) == 4",
+            "		testSuccess()"
+        );
+    }
+
+    @Test
+    public void overloadSameParameterTypeButDifferentReturnType() {
+        testAssertOkLines(true,
+            "package test",
+            "native testSuccess()",
+            "interface A",
+            "	 function foo(int lvl) returns string",
+            "interface B",
+            "	 function foo(int lvl) returns int",
+            "function bar(A a)",
+            "    testSuccess()",
+            "function bar(B b)",
+            "init",
+            "	 bar(lvl -> \"\")"
         );
     }
 

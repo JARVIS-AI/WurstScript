@@ -312,11 +312,17 @@ public class StmtTranslation {
         for (int i = 0; i < switchStmt.getCases().size(); i++) {
             cse = switchStmt.getCases().get(i);
             if (lastIf == null) {
-                lastIf = ImIf(switchStmt, ImOperatorCall(WurstOperator.EQ, ImExprs(tempVar.copy(), cse.getExpr().imTranslateExpr(t, f))), ImStmts(t
+                lastIf = ImIf(switchStmt, translateSwitchCase(cse, tempVar, f, t), ImStmts(t
                         .translateStatements(f, cse.getStmts())), ImStmts());
                 result.add(lastIf);
+            } else if (i == switchStmt.getCases().size() - 1
+                    && switchStmt.getSwitchDefault() instanceof NoDefaultCase
+                    && switchStmt.calculateHandlesAllCases()) {
+                // if this is the last case and all cases are covered, then just add
+                // the code to the else statement without checking the condition:
+                lastIf.setElseBlock(ImStmts(t.translateStatements(f, cse.getStmts())));
             } else {
-                ImIf tmp = ImIf(switchStmt, ImOperatorCall(WurstOperator.EQ, ImExprs(tempVar.copy(), cse.getExpr().imTranslateExpr(t, f))), ImStmts
+                ImIf tmp = ImIf(switchStmt, translateSwitchCase(cse, tempVar, f, t), ImStmts
                         (t.translateStatements(f, cse.getStmts())), ImStmts());
                 lastIf.setElseBlock(ImStmts(tmp));
                 lastIf = tmp;
@@ -339,6 +345,23 @@ public class StmtTranslation {
 
 
         return ImHelper.statementExprVoid(ImStmts(result));
+    }
+
+    /**
+     * translate the expressions of a switch case to
+     * <p>
+     * case x | y | z
+     * <p>
+     * is translated to
+     * <p>
+     * tempVar == x or tempVar == y or tempVar == z
+     */
+    private static ImExpr translateSwitchCase(SwitchCase cse, ImExpr tempVar, ImFunction f, ImTranslator t) {
+        return cse.getExpressions()
+                .stream()
+                .<ImExpr>map(e -> ImOperatorCall(WurstOperator.EQ, ImExprs(tempVar.copy(), e.imTranslateExpr(t, f))))
+                .reduce((x, y) -> ImOperatorCall(WurstOperator.OR, ImExprs(x, y)))
+                .orElseGet(() -> JassIm.ImBoolVal(true));
     }
 
     public static ImStmt translate(EndFunctionStatement endFunctionStatement, ImTranslator translator, ImFunction f) {

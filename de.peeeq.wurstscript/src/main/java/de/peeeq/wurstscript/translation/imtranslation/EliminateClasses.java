@@ -1,9 +1,10 @@
 package de.peeeq.wurstscript.translation.imtranslation;
 
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import de.peeeq.wurstscript.WurstOperator;
-import de.peeeq.wurstscript.ast.AstElementWithNameId;
+import de.peeeq.wurstscript.ast.*;
 import de.peeeq.wurstscript.ast.Element;
 import de.peeeq.wurstscript.attributes.CompileError;
 import de.peeeq.wurstscript.jassIm.*;
@@ -11,10 +12,10 @@ import de.peeeq.wurstscript.translation.imtojass.TypeRewriteMatcher;
 import de.peeeq.wurstscript.translation.imtojass.TypeRewriter;
 import de.peeeq.wurstscript.types.TypesHelper;
 import de.peeeq.wurstscript.utils.Pair;
+import org.jetbrains.annotations.NotNull;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 import static de.peeeq.wurstscript.types.TypesHelper.imInt;
@@ -24,12 +25,26 @@ import static de.peeeq.wurstscript.types.TypesHelper.imInt;
  */
 public class EliminateClasses {
 
+    public static final String TYPE_ID_TO_TYPE_NAME = "typeIdToTypeName";
+    public static final String MAX_TYPE_ID = "maxTypeId";
+    public static final String INSTANCE_COUNT = "instanceCount";
+    public static final String MAX_INSTANCE_COUNT = "maxInstanceCount";
     private final ImTranslator translator;
     private final ImProg prog;
     private final Map<ImVar, ImVar> fieldToArray = Maps.newLinkedHashMap();
     private final Map<ImMethod, ImFunction> dispatchFuncs = Maps.newLinkedHashMap();
     private final RecycleCodeGenerator recycleCodeGen = new RecycleCodeGeneratorQueue();
     private boolean checkedDispatch;
+    private Set<String> specialNatives = ImmutableSet.of(
+        TYPE_ID_TO_TYPE_NAME,
+        MAX_TYPE_ID,
+        INSTANCE_COUNT,
+        MAX_INSTANCE_COUNT
+    );
+    private ImFunction typeIdToTypeNameFunc;
+    private ImFunction maxTypeIdFunc;
+    private ImFunction instanceCountFunc;
+    private ImFunction maxInstanceCountFunc;
 
     public EliminateClasses(ImTranslator tr, ImProg prog, boolean checkedDispatch) {
         translator = tr;
@@ -38,6 +53,7 @@ public class EliminateClasses {
     }
 
     public void eliminateClasses() {
+        createReflectionFunctions();
         moveFunctionsOutOfClasses();
 
         for (ImClass c : prog.getClasses()) {
@@ -51,13 +67,127 @@ public class EliminateClasses {
         }
 
         for (ImFunction f : prog.getFunctions()) {
-            eliminateClassRelatedExprs(f);
+            eliminateClassRelatedExprs(f.getBody());
+        }
+
+        for (Map.Entry<ImVar, List<ImExpr>> entry : prog.getGlobalInits().entrySet()) {
+            ImExprs exprs = JassIm.ImExprs();
+            List<ImExpr> value = entry.getValue();
+            for (int i = 0, valueSize = value.size(); i < valueSize; i++) {
+                ImExpr e = value.get(i);
+                List<ImExpr> newValues = new ArrayList<>();
+                if (e.getParent() == null) {
+                    exprs.add(e);
+                    eliminateClassRelatedExprs(exprs);
+                    newValues.add(exprs.remove(0));
+                } else {
+                    eliminateClassRelatedExprs(exprs);
+                    newValues.add(e);
+                }
+                entry.setValue(newValues);
+            }
         }
 
         prog.getClasses().clear();
         prog.getMethods().clear();
 
         eliminateClassTypes();
+    }
+
+    private void createReflectionFunctions() {
+        typeIdToTypeNameFunc = accessClassManagementVar(
+            "typeIdToTypeName",
+            TypesHelper.imString(),
+            JassIm.ImStringVal("unknown"),
+            c -> JassIm.ImStringVal(calculateClassName(c)));
+        instanceCountFunc = accessClassManagementVar(
+            "instanceCount",
+            TypesHelper.imInt(),
+            JassIm.ImIntVal(0),
+            c ->
+                JassIm.ImOperatorCall(WurstOperator.MINUS,
+                    JassIm.ImExprs(
+                        JassIm.ImVarAccess(translator.getClassManagementVarsFor(c).maxIndex),
+                        JassIm.ImVarAccess(translator.getClassManagementVarsFor(c).freeCount))));
+        maxInstanceCountFunc = accessClassManagementVar(
+            "maxInstanceCount",
+            TypesHelper.imInt(),
+            JassIm.ImIntVal(0),
+            c -> JassIm.ImVarAccess(translator.getClassManagementVarsFor(c).maxIndex));
+        maxTypeIdFunc = maxTypeIdFunc();
+    }
+
+    @NotNull
+    private ImFunction maxTypeIdFunc() {
+        ImVars parameters = JassIm.ImVars();
+        int maxTypeId = calculateMaxTypeId(prog);
+        ImFunction f = JassIm.ImFunction(prog.getTrace(), "maxTypeId", JassIm.ImTypeVars(), parameters, imInt(), JassIm.ImVars(), JassIm.ImStmts(JassIm.ImReturn(prog.getTrace(), JassIm.ImIntVal(maxTypeId))), Collections.emptyList());
+        prog.getFunctions().add(f);
+        return f;
+    }
+
+    public static int calculateMaxTypeId(ImProg prog) {
+        return prog.attrTypeId().values().stream().mapToInt(x -> x).max().orElse(-1);
+    }
+
+    @NotNull
+    private ImFunction accessClassManagementVar(String funcName, ImType returnType, ImExpr defaultReturn, Function<ImClass, ImExpr> makeAccess) {
+        Element trace = prog.getTrace();
+        ImVar typeId = JassIm.ImVar(trace, TypesHelper.imInt(), "typeId", false);
+        ImVars parameters = JassIm.ImVars(typeId);
+        ImVars locals = JassIm.ImVars();
+        Map<ImClass, Integer> classId = prog.attrTypeId();
+        int maxTypeId = calculateMaxTypeId(prog);
+        ImClass[] typeIdToClass = new ImClass[maxTypeId + 1];
+        for (Map.Entry<ImClass, Integer> e : classId.entrySet()) {
+            typeIdToClass[e.getValue()] = e.getKey();
+        }
+        ImStmts body = generateBinarySearch(1, maxTypeId, typeId, typeIdToClass, makeAccess);
+        body.add(
+            JassIm.ImReturn(trace, defaultReturn)
+        );
+
+        ImFunction f = JassIm.ImFunction(trace, funcName, JassIm.ImTypeVars(), parameters, returnType, locals, body, Collections.emptyList());
+        prog.getFunctions().add(f);
+        return f;
+    }
+
+    private ImStmts generateBinarySearch(int lower, int upper, ImVar typeId, ImClass[] typeIdToClass, Function<ImClass, ImExpr> makeAccess) {
+        if (lower > upper) {
+            return JassIm.ImStmts();
+        } else if (lower == upper) {
+            return JassIm.ImStmts(JassIm.ImReturn(prog.getTrace(), makeAccess.apply(typeIdToClass[lower])));
+        } else {
+            int mid = lower + (upper - lower) / 2;
+            return
+                JassIm.ImStmts(JassIm.ImIf(prog.getTrace(),
+                    JassIm.ImOperatorCall(WurstOperator.LESS_EQ,
+                        JassIm.ImExprs(JassIm.ImVarAccess(typeId), JassIm.ImIntVal(mid))),
+                    generateBinarySearch(lower, mid, typeId, typeIdToClass, makeAccess),
+                    generateBinarySearch(mid + 1, upper, typeId, typeIdToClass, makeAccess)));
+
+        }
+    }
+
+    public static String calculateClassName(ImClass c) {
+        Element trace = c.attrTrace();
+        if (trace instanceof ClassOrInterface) {
+            ClassOrInterface t = (ClassOrInterface) trace;
+            return makeName(t);
+        }
+        return c.getName();
+    }
+
+    private static String makeName(ClassOrInterface t) {
+        ClassOrInterface parent = t.getParent().attrNearestClassOrInterface();
+        if (parent != null) {
+            return makeName(parent) + "." + t.getName();
+        }
+        PackageOrGlobal p = t.attrNearestPackage();
+        if (p instanceof WPackage) {
+            return ((WPackage) p).getName() + "." + t.getName();
+        }
+        return t.getName();
     }
 
     private void eliminateClassTypes() {
@@ -89,7 +219,7 @@ public class EliminateClasses {
         for (ImVar f : c.getFields()) {
             ImType type = ImHelper.toArray(f.getType());
             ImVar v = JassIm
-                    .ImVar(f.getTrace(), type, f.getName(), false);
+                .ImVar(f.getTrace(), type, f.getName(), false);
             prog.getGlobals().add(v);
             fieldToArray.put(f, v);
         }
@@ -109,7 +239,7 @@ public class EliminateClasses {
         addSubMethods(m, methods);
 
         List<Pair<IntRange, ImMethod>> ranges = calculateTypeIdRanges(c,
-                methods);
+            methods);
 
 
         List<FunctionFlag> flags = new ArrayList<>();
@@ -120,9 +250,9 @@ public class EliminateClasses {
 
 
         ImFunction df = JassIm.ImFunction(m.getTrace(), "dispatch_" + c.getName() + "_" + m.getName(), JassIm.ImTypeVars(), m
-                .getImplementation().getParameters().copy(), m
-                .getImplementation().getReturnType(), JassIm.ImVars(), JassIm
-                .ImStmts(), flags);
+            .getImplementation().getParameters().copy(), m
+            .getImplementation().getReturnType(), JassIm.ImVars(), JassIm
+            .ImStmts(), flags);
         prog.getFunctions().add(df);
         dispatchFuncs.put(m, df);
 
@@ -144,7 +274,7 @@ public class EliminateClasses {
             resultVar = null;
         } else {
             resultVar = JassIm.ImVar(df.getTrace(), returnType, m.getName()
-                    + "_result", false);
+                + "_result", false);
             df.getLocals().add(resultVar);
         }
 
@@ -158,34 +288,34 @@ public class EliminateClasses {
             String methodName = getMethodName(m);
 
             df.getBody().add(
-                    // if typeId[this] == 0
-                    JassIm.ImIf(
-                            df.getTrace(), JassIm.ImOperatorCall(WurstOperator.EQ, JassIm.ImExprs(
-                                    (ImExpr) typeId.copy(), JassIm.ImIntVal(0)
-                            )),
-                            // then
-                            // if this == 0
-                            JassIm.ImStmts(JassIm.ImIf(df.getTrace(), JassIm.ImOperatorCall(WurstOperator.EQ, JassIm.ImExprs(
-                                    JassIm.ImVarAccess(thisVar), JassIm.ImIntVal(0)
-                                    )),
-                                    // then error(NPE)
-                                    JassIm.ImStmts(translator.imError(trace, JassIm.ImStringVal("Nullpointer exception when calling " + c.getName() + "." + methodName)))
-                                    ,
-                                    // else error(unallocated)
-                                    JassIm.ImStmts(translator.imError(trace, JassIm.ImStringVal("Called " + c.getName() + "." + methodName + " on invalid object.")))
-                            ))
+                // if typeId[this] == 0
+                JassIm.ImIf(
+                    df.getTrace(), JassIm.ImOperatorCall(WurstOperator.EQ, JassIm.ImExprs(
+                        (ImExpr) typeId.copy(), JassIm.ImIntVal(0)
+                    )),
+                    // then
+                    // if this == 0
+                    JassIm.ImStmts(JassIm.ImIf(df.getTrace(), JassIm.ImOperatorCall(WurstOperator.EQ, JassIm.ImExprs(
+                        JassIm.ImVarAccess(thisVar), JassIm.ImIntVal(0)
+                        )),
+                        // then error(NPE)
+                        JassIm.ImStmts(translator.imError(trace, JassIm.ImStringVal("Nullpointer exception when calling " + c.getName() + "." + methodName)))
+                        ,
+                        // else error(unallocated)
+                        JassIm.ImStmts(translator.imError(trace, JassIm.ImStringVal("Called " + c.getName() + "." + methodName + " on invalid object.")))
+                    ))
 
-                            , JassIm.ImStmts())
+                    , JassIm.ImStmts())
             );
         }
 
 
         createDispatch(df, df.getBody(), resultVar, typeId, ranges, 0,
-                ranges.size() - 1);
+            ranges.size() - 1);
         if (resultVar != null) {
             df.getBody().add(
-                    JassIm.ImReturn(df.getTrace(),
-                            JassIm.ImVarAccess(resultVar)));
+                JassIm.ImReturn(df.getTrace(),
+                    JassIm.ImVarAccess(resultVar)));
         }
     }
 
@@ -208,7 +338,7 @@ public class EliminateClasses {
             }
             // only one method, call it
             ImFunctionCall call = JassIm.ImFunctionCall(df.getTrace(), ranges
-                    .get(start).getB().getImplementation(), JassIm.ImTypeArguments(), arguments, false, CallType.NORMAL);
+                .get(start).getB().getImplementation(), JassIm.ImTypeArguments(), arguments, false, CallType.NORMAL);
             if (resultVar == null) {
                 stmts.add(call);
             } else {
@@ -219,16 +349,16 @@ public class EliminateClasses {
             ImStmts thenBlock = JassIm.ImStmts();
             ImStmts elseBlock = JassIm.ImStmts();
             ImExpr condition = JassIm
-                    .ImOperatorCall(
-                            WurstOperator.LESS_EQ,
-                            JassIm.ImExprs((ImExpr) typeId.copy(),
-                                    JassIm.ImIntVal(ranges.get(mid).getA().end)));
+                .ImOperatorCall(
+                    WurstOperator.LESS_EQ,
+                    JassIm.ImExprs((ImExpr) typeId.copy(),
+                        JassIm.ImIntVal(ranges.get(mid).getA().end)));
             stmts.add(JassIm.ImIf(df.getTrace(), condition, thenBlock,
-                    elseBlock));
+                elseBlock));
 
             createDispatch(df, thenBlock, resultVar, typeId, ranges, start, mid);
             createDispatch(df, elseBlock, resultVar, typeId, ranges, mid + 1,
-                    end);
+                end);
         }
     }
 
@@ -295,7 +425,7 @@ public class EliminateClasses {
         }
     }
 
-    private void eliminateClassRelatedExprs(ImFunction f) {
+    private void eliminateClassRelatedExprs(de.peeeq.wurstscript.jassIm.Element body) {
         final List<ImMemberAccess> mas = Lists.newArrayList();
         final List<ImMethodCall> mcs = Lists.newArrayList();
         final List<ImAlloc> allocs = Lists.newArrayList();
@@ -303,7 +433,8 @@ public class EliminateClasses {
         final List<ImInstanceof> instaneofs = Lists.newArrayList();
         final List<ImTypeIdOfObj> typeIdObjs = Lists.newArrayList();
         final List<ImTypeIdOfClass> typeIdClasses = Lists.newArrayList();
-        f.getBody().accept(new ImStmts.DefaultVisitor() {
+        final List<ImFunctionCall> nativeCalls = Lists.newArrayList();
+        body.accept(new de.peeeq.wurstscript.jassIm.Element.DefaultVisitor() {
             @Override
             public void visit(ImMemberAccess e) {
                 super.visit(e);
@@ -345,6 +476,18 @@ public class EliminateClasses {
                 super.visit(e);
                 typeIdObjs.add(e);
             }
+
+            @Override
+            public void visit(ImFunctionCall fc) {
+                super.visit(fc);
+                ImFunction func = fc.getFunc();
+                if (!func.hasFlag(FunctionFlagEnum.IS_NATIVE)) {
+                    return;
+                }
+                if (specialNatives.contains(func.getName())) {
+                    nativeCalls.add(fc);
+                }
+            }
         });
         for (ImMemberAccess ma : mas) {
             replaceMemberAccess(ma);
@@ -367,6 +510,29 @@ public class EliminateClasses {
         for (ImTypeIdOfObj e : typeIdObjs) {
             replaceTypeIdOfObj(e);
         }
+        for (ImFunctionCall nativeCall : nativeCalls) {
+            rewriteObjectNative(nativeCall);
+        }
+    }
+
+    private void rewriteObjectNative(ImFunctionCall nativeCall) {
+        ImFunction func = nativeCall.getFunc();
+        switch (func.getName()) {
+            case TYPE_ID_TO_TYPE_NAME:
+                nativeCall.setFunc(typeIdToTypeNameFunc);
+                break;
+            case MAX_TYPE_ID:
+                nativeCall.setFunc(maxTypeIdFunc);
+                break;
+            case INSTANCE_COUNT:
+                nativeCall.setFunc(instanceCountFunc);
+                break;
+            case MAX_INSTANCE_COUNT:
+                nativeCall.setFunc(maxInstanceCountFunc);
+                break;
+            default:
+                throw new RuntimeException("unhandled case: " + func.getName());
+        }
     }
 
     private void replaceTypeIdOfObj(ImTypeIdOfObj e) {
@@ -384,8 +550,8 @@ public class EliminateClasses {
         ImFunction f = e.getNearestFunc();
         List<ImClass> allSubClasses = getAllSubclasses(e.getClazz().getClassDef());
         List<Integer> subClassIds = allSubClasses.stream()
-                .map(ImClass::attrTypeId)
-                .collect(Collectors.toList());
+            .map(ImClass::attrTypeId)
+            .collect(Collectors.toList());
         List<IntRange> idRanges = IntRange.createFromIntList(subClassIds);
         ImExpr obj = e.getObj();
         obj.setParent(null);
@@ -408,7 +574,7 @@ public class EliminateClasses {
         }
         if (useTempVar) {
             newExpr = JassIm.ImStatementExpr(JassIm.ImStmts(
-                    JassIm.ImSet(f.getTrace(), JassIm.ImVarAccess(tempVar), objTypeId)
+                JassIm.ImSet(f.getTrace(), JassIm.ImVarAccess(tempVar), objTypeId)
             ), newExpr);
         }
         e.replaceBy(newExpr);
@@ -426,8 +592,8 @@ public class EliminateClasses {
             return JassIm.ImOperatorCall(WurstOperator.EQ, JassIm.ImExprs((ImExpr) obj.copy(), JassIm.ImIntVal(range.start)));
         } else {
             return JassIm.ImOperatorCall(WurstOperator.AND, JassIm.ImExprs(
-                    JassIm.ImOperatorCall(WurstOperator.GREATER_EQ, JassIm.ImExprs((ImExpr) obj.copy(), JassIm.ImIntVal(range.start))),
-                    JassIm.ImOperatorCall(WurstOperator.LESS_EQ, JassIm.ImExprs((ImExpr) obj.copy(), JassIm.ImIntVal(range.end)))));
+                JassIm.ImOperatorCall(WurstOperator.GREATER_EQ, JassIm.ImExprs((ImExpr) obj.copy(), JassIm.ImIntVal(range.start))),
+                JassIm.ImOperatorCall(WurstOperator.LESS_EQ, JassIm.ImExprs((ImExpr) obj.copy(), JassIm.ImIntVal(range.end)))));
         }
     }
 

@@ -16,7 +16,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
-import java.util.stream.Collectors;
 
 import static java.util.Collections.singletonList;
 
@@ -41,7 +40,7 @@ public class ClosureTranslator {
 
 
     public ImExpr translate() {
-        if (e.attrExpectedTyp() instanceof WurstTypeCode) {
+        if (e.attrExpectedTypAfterOverloading() instanceof WurstTypeCode) {
             return translateAnonFunc();
         } else {
             ImClass c = createClass();
@@ -72,7 +71,7 @@ public class ClosureTranslator {
 
 
     private void callSuperConstructor(ImVar clVar, ImStmts stmts, ImClass c) {
-        WurstType t = e.attrExpectedTyp();
+        WurstType t = e.attrExpectedTypAfterOverloading();
         if (t instanceof WurstTypeClass) {
             WurstTypeClass ct = (WurstTypeClass) t;
             ClassDef cd = ct.getClassDef();
@@ -97,6 +96,7 @@ public class ClosureTranslator {
 
     private ImExpr translateAnonFunc() {
         impl = tr.getFuncFor(e);
+        impl.setName("code_" + makeNameSuffix());
         impl.getParameters().clear();
         ImExpr translated = e.getImplementation().imTranslateExpr(tr, impl);
 
@@ -174,26 +174,27 @@ public class ClosureTranslator {
     }
 
     private String makeClassName(ImClassType superClass) {
-        String res =
-                superClass.getClassDef().getName()
-                        + "_line" + e.attrSource().getLine();
-        return addScopeNames(res);
+        return superClass.getClassDef().getName() + makeNameSuffix();
     }
 
-    private String makeFuncName(FuncDef superClass) {
-        String res = superClass.getName() + "_line" + e.attrSource().getLine();
-        return addScopeNames(res);
-    }
-
-    private String addScopeNames(String res) {
-        Element elem = e;
+    private String makeNameSuffix() {
+        StringBuilder sb = new StringBuilder();
+        Element elem = this.e;
         while (elem != null) {
             if (elem instanceof NamedScope) {
-                res = ((NamedScope) elem).getName() + "_" + res;
+                sb.append("_");
+                sb.append(((NamedScope) elem).getName());
+            } else if (elem instanceof AstElementWithFuncName) {
+                sb.append("_");
+                sb.append(((AstElementWithFuncName) elem).getFuncNameId().getName());
             }
             elem = elem.getParent();
         }
-        return res;
+        return sb.toString();
+    }
+
+    private String makeFuncName(FuncDef superClass) {
+        return superClass.getName() + makeNameSuffix();
     }
 
     /**
@@ -309,12 +310,11 @@ public class ClosureTranslator {
 
     private ImClassType getSuperClass() {
         // since the expected type is just an approximation, we calculate the exact type here again:
-        WurstTypeClassOrInterface t = (WurstTypeClassOrInterface) e.attrExpectedTyp();
+        WurstTypeClassOrInterface t = (WurstTypeClassOrInterface) e.attrExpectedTypAfterOverloading();
         ClassOrInterface classDef = t.getDef();
         t = (WurstTypeClassOrInterface) classDef.attrTyp();
-        fj.data.List<TypeParamDef> typeParameters = fj.data.List.iterableList(classDef.getTypeParameters());
         VariableBinding mapping = VariableBinding.emptyMapping()
-                .withTypeVariables(typeParameters);
+                .withTypeVariables(classDef.getTypeParameters());
         WurstType closureType = e.attrTyp();
         VariableBinding mapping2 = closureType.matchAgainstSupertype(t, e, mapping, VariablePosition.RIGHT);
         if (mapping2 == null) {

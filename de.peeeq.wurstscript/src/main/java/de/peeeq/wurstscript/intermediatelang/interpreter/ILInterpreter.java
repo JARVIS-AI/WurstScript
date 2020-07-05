@@ -14,10 +14,12 @@ import de.peeeq.wurstscript.jassinterpreter.TestFailException;
 import de.peeeq.wurstscript.jassinterpreter.TestSuccessException;
 import de.peeeq.wurstscript.parser.WPos;
 import de.peeeq.wurstscript.translation.imtranslation.FunctionFlagEnum;
+import de.peeeq.wurstscript.translation.imtranslation.ImHelper;
 import org.eclipse.jdt.annotation.Nullable;
 
 import java.io.File;
 import java.util.Arrays;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 public class ILInterpreter implements AbstractInterpreter {
@@ -25,14 +27,14 @@ public class ILInterpreter implements AbstractInterpreter {
     private final ProgramState globalState;
     private final TimerMockHandler timerMockHandler = new TimerMockHandler();
 
-    public ILInterpreter(ImProg prog, WurstGui gui, @Nullable File mapFile, ProgramState globalState) {
+    public ILInterpreter(ImProg prog, WurstGui gui, Optional<File> mapFile, ProgramState globalState) {
         this.prog = prog;
         this.globalState = globalState;
         globalState.addNativeProvider(new BuiltinFuncs(globalState));
         globalState.addNativeProvider(new NativeFunctions());
     }
 
-    public ILInterpreter(ImProg prog, WurstGui gui, @Nullable File mapFile, boolean isCompiletime) {
+    public ILInterpreter(ImProg prog, WurstGui gui, Optional<File> mapFile, boolean isCompiletime) {
         this(prog, gui, mapFile, new ProgramState(gui, prog, isCompiletime));
     }
 
@@ -162,7 +164,11 @@ public class ILInterpreter implements AbstractInterpreter {
             }
         }
         globalState.compilationError("function " + f.getName() + " cannot be used from the Wurst interpreter.\n" + errors);
-        return new LocalState();
+        if (f.getReturnType() instanceof ImVoid) {
+            return new LocalState();
+        }
+        ILconst returnValue = ImHelper.defaultValueForComplexType(f.getReturnType()).evaluate(globalState, new LocalState());
+        return new LocalState(returnValue);
     }
 
     private static boolean isCompiletimeNative(ImFunction f) {
@@ -242,5 +248,27 @@ public class ILInterpreter implements AbstractInterpreter {
     @Override
     public void completeTimers() {
         timerMockHandler.completeTimers();
+    }
+
+    @Override
+    public ImProg getImProg() {
+        return prog;
+    }
+
+    @Override
+    public int getInstanceCount(int val) {
+        return (int) globalState.getAllObjects()
+            .stream()
+            .filter(o -> o.getType().getClassDef().attrTypeId() == val)
+            .filter(o -> !o.isDestroyed())
+            .count();
+    }
+
+    @Override
+    public int getMaxInstanceCount(int val) {
+        return (int) globalState.getAllObjects()
+            .stream()
+            .filter(o -> o.getType().getClassDef().attrTypeId() == val)
+            .count();
     }
 }

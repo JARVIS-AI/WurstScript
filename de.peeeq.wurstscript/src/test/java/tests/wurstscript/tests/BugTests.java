@@ -11,8 +11,6 @@ import java.io.File;
 import java.io.IOException;
 
 public class BugTests extends WurstScriptTest {
-
-
     private static final String TEST_DIR = "./testscripts/concept/";
 
     @Test
@@ -817,6 +815,8 @@ public class BugTests extends WurstScriptTest {
     public void unreadVarWarning2() { // #380
         testAssertErrorsLines(true, "i is never read",
                 "package test",
+                "@annotation public function annotation()",
+                "@annotation public function extern()",
                 "@extern native I2S(int x) returns string",
                 "native testSuccess()",
                 "init",
@@ -825,6 +825,26 @@ public class BugTests extends WurstScriptTest {
                 "	i = i + 1",
                 "	testSuccess()"
         );
+    }
+
+
+    @Test
+    public void unreadVarWarningArrays() { // #813
+        testAssertOkLines(false,
+                "package test",
+                "@annotation public function annotation()",
+                "@annotation public function extern()",
+                "@extern native I2S(int x) returns string",
+                "init",
+                "    integer array b",
+                "    b[0] = 0 // Warning.",
+                "    b[1] = 0 // Warning.",
+                "    b[2] = 0 // No warning.",
+                "    I2S(b[0])",
+                "    I2S(b[1])",
+                "    for i = 0 to 2",
+                "        I2S(b[i])"
+                );
     }
 
 
@@ -884,7 +904,7 @@ public class BugTests extends WurstScriptTest {
                         "abstract class Hey\n" +
                         "	function foo()";
 
-        WurstModel model = test().executeProg(false).withStdLib(false).withCu(compilationUnit("testLine", "testLine")).run().getModel();
+        WurstModel model = test().executeProg(false).withStdLib(false).withCu(compilationUnit("testLine", input)).run().getModel();
 
         model.accept(new WurstModel.DefaultVisitor() {
             @Override
@@ -1230,6 +1250,146 @@ public class BugTests extends WurstScriptTest {
                 "    if -$4f != -79",
                 "        testFail(\"f\")",
                 "    testSuccess()"
+        );
+    }
+
+	@Test
+	public void testSelfAssignmentWarning() {
+		testAssertErrorsLines(false, "The assignment to local variable i probably has no effect",
+			"package test",
+			"@annotation public function annotation()",
+			"@annotation public function extern()",
+			"@extern native I2S(int x) returns string",
+			"native testSuccess()",
+			"init",
+			"	var i = 5",
+			"	I2S(i)",
+			"	i = i",
+			"	I2S(i)",
+			"	testSuccess()"
+		);
+	}
+
+	@Test
+	public void testSelfAssignmentWarningDot() {
+		testAssertErrorsLines(false, "The assignment to variable i probably has no effect",
+			"package test",
+			"@annotation public function annotation()",
+			"@annotation public function extern()",
+			"@extern native I2S(int x) returns string",
+			"native testSuccess()",
+			"class A",
+			"	var i = 5",
+			"	construct()",
+			"		this.i = i",
+			"init",
+			"	new A()",
+			"	testSuccess()"
+		);
+	}
+
+	@Test
+	public void testSelfAssignmentNoWarning() {
+		testAssertOkLines(true,
+			"package test",
+			"@annotation public function annotation()",
+			"@annotation public function extern()",
+			"@extern native I2S(int x) returns string",
+			"native testSuccess()",
+			"class A",
+			"	var i = 5",
+			"	construct(int i)",
+			"		this.i = i",
+			"init",
+			"	new A(1)",
+			"	testSuccess()"
+		);
+	}
+
+    @Test
+    public void bitset_add() {
+        testAssertOkLines(true,
+            "package Test",
+            "native testSuccess()",
+            "native testFail(string msg)",
+            "@extern native I2S(int i) returns string",
+            "public tuple bitset(int val)",
+            "public function int.pow(int x) returns int",
+            "    int result = 1",
+            "    for int i=1 to x",
+            "        result *= this",
+            "    return result",
+            "public function bitset.add(int v) returns bitset",
+            "    let pow = 2 .pow(v)",
+            "    return not this.containsPow(pow) ? bitset(this.val + pow) : this",
+            "function bitset.containsPow(int pow) returns boolean",
+            "    return (this.val mod (pow * 2)) >= pow",
+            "init",
+            "    let a = bitset(5)", // {0,2}
+            "    let res = a.add(1)",
+            "    if res.val == 7",
+            "        testSuccess()",
+            "    else",
+            "        testFail(I2S(res.val))"
+        );
+    }
+
+    @Test
+    public void middlewareOverload() throws IOException {
+        testAssertOkFile(new File(TEST_DIR + "MiddlewareOverload.wurst"), true);
+    }
+
+    @Test
+    public void cycle_with_generics() {
+        testAssertOkLines(true,
+            "package Test",
+            "native testSuccess()",
+            "public abstract class VoidFunction<T>",
+            "    abstract function call(T t)",
+            "int x = 0",
+            "function foo(int i)",
+            "    x++",
+            "    VoidFunction<int> f = j -> bar(j - 1)",
+            "    f.call(i)",
+            "function bar(int i)",
+            "    x++",
+            "    VoidFunction<int> f = j -> foo(j - 1)",
+            "    if i > 0",
+            "        f.call(i)",
+            "init",
+            "    bar(10)",
+            "    if x == 11",
+            "        testSuccess()"
+        );
+    }
+
+    @Test
+    public void executeFuncWithStackTrace() {
+        testAssertOkLines(true,
+            "package Test",
+            "native testSuccess()",
+            "@extern native ExecuteFunc(string f)",
+            "function getStackTraceString() returns string",
+            "    return \"foo\"",
+            "class A",
+            "    function bar()",
+            "        testSuccess()",
+            "A a = new A",
+            "function foo()",
+            "    a.bar()", // calling a function to ensure stacktraces are needed
+            "init",
+            "    ExecuteFunc(\"foo\")"
+        );
+    }
+
+    @Test
+    public void agentTypeComparisonsWurst() {
+        testAssertErrorsLinesWithStdLib(true, "Cannot compare types sound with rect",
+            "package Test",
+            "function compare(sound s, rect r) returns boolean",
+            "    return s == r",
+            "init",
+            "    compare(null, null)"
         );
     }
 

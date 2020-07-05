@@ -44,6 +44,7 @@ public class GetCompletions extends UserRequest<CompletionList> {
     private WurstType expectedType;
     private ModelManager modelManager;
     private boolean isIncomplete = false;
+    private CompilationUnit cu;
 
 
     public GetCompletions(CompletionParams position, BufferManager bufferManager) {
@@ -67,7 +68,7 @@ public class GetCompletions extends UserRequest<CompletionList> {
     @Override
     public CompletionList execute(ModelManager modelManager) {
         this.modelManager = modelManager;
-        CompilationUnit cu = modelManager.replaceCompilationUnitContent(filename, buffer, false);
+        cu = modelManager.replaceCompilationUnitContent(filename, buffer, false);
         if (cu == null) {
             return new CompletionList(Collections.emptyList());
         }
@@ -75,8 +76,10 @@ public class GetCompletions extends UserRequest<CompletionList> {
         // sort: highest rating first, then sort by label
         if (result != null) {
             result.sort(completionItemComparator());
+            return new CompletionList(isIncomplete, result);
+        } else {
+            return new CompletionList(isIncomplete, Collections.emptyList());
         }
-        return new CompletionList(isIncomplete, result);
     }
 
     private Comparator<CompletionItem> completionItemComparator() {
@@ -106,7 +109,7 @@ public class GetCompletions extends UserRequest<CompletionList> {
             searchMode = mode;
             List<CompletionItem> completions = Lists.newArrayList();
 
-            elem = Utils.getAstElementAtPos(cu, line, column + 1, false);
+            elem = Utils.getAstElementAtPos(cu, line, column + 1, false).get();
             WLogger.info("get completions at " + Utils.printElement(elem));
             expectedType = null;
             if (elem instanceof Expr) {
@@ -119,8 +122,6 @@ public class GetCompletions extends UserRequest<CompletionList> {
 
             dropBadCompletions(completions);
             removeDuplicates(completions);
-
-            //		Collections.sort(completions, c)
 
             if (completions.size() > 0) {
                 return completions;
@@ -149,7 +150,7 @@ public class GetCompletions extends UserRequest<CompletionList> {
                 WurstTypeNamedScope ct = (WurstTypeNamedScope) leftType;
                 for (DefLink nameLink : ct.nameLinks().values()) {
                     if (isSuitableCompletion(nameLink.getName())
-                            && nameLink.getReceiverType() != null
+                            && (nameLink.getReceiverType() != null || nameLink instanceof TypeDefLink)
                             && nameLink.getVisibility() == Visibility.PUBLIC) {
                         CompletionItem completion = makeNameDefCompletion(nameLink);
                         completions.add(completion);
@@ -381,6 +382,16 @@ public class GetCompletions extends UserRequest<CompletionList> {
         }
     }
 
+    private boolean isAtEndOfLine() {
+        String line = currentLine();
+        for (int i = column + 1; i < line.length(); i++) {
+            if (!Character.isWhitespace(line.charAt(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private void removeDuplicates(List<CompletionItem> completions) {
         for (int i = 0; i < completions.size() - 1; i++) {
             for (int j = completions.size() - 1; j > i; j--) {
@@ -564,22 +575,62 @@ public class GetCompletions extends UserRequest<CompletionList> {
         completion.setDetail(getFunctionDescriptionShort(f.getDef()));
         completion.setDocumentation(HoverInfo.descriptionString(f.getDef()));
         completion.setInsertText(replacementString);
-        completion.setSortText(ratingToString(calculateRating(f.getName(), f.getReturnType())));
+		double rating = calculateRating(f.getName(), f.getReturnType());
+		if (f.getDef().attrHasAnnotation("deprecated")) {
+			rating -= 0.05;
+		}
+		completion.setSortText(ratingToString(rating));
         // TODO use call signature instead for generics
 //        completion.set
 
         if (!isBeforeParenthesis()) {
-            addParamSnippet(replacementString, f.getParameterNames(), completion);
+            addParamSnippet(replacementString, f, completion);
         }
 
 
         return completion;
     }
 
-    private void addParamSnippet(String replacementString, List<String> paramNames, CompletionItem completion) {
+    private void addParamSnippet(String replacementString, FuncLink f, CompletionItem completion) {
+        List<String> paramNames = f.getParameterNames();
+        StringBuilder lambdaReplacement = null;
+        List<WurstType> parameterTypes = f.getParameterTypes();
+        if (isAtEndOfLine() && !parameterTypes.isEmpty()) {
+            WurstType lastParamType = Utils.getLast(parameterTypes);
+            if (lastParamType instanceof WurstTypeClassOrInterface) {
+                WurstTypeClassOrInterface it = (WurstTypeClassOrInterface) lastParamType;
+                FuncLink singleAbstractMethod = it.findSingleAbstractMethod(elem);
+                if (singleAbstractMethod != null) {
+                    paramNames = Utils.init(paramNames);
+
+                    if (singleAbstractMethod.getParameterTypes().size() == 0) {
+                        lambdaReplacement = new StringBuilder(" -> \n");
+                        cu.getCuInfo().getIndentationMode().appendIndent(lambdaReplacement, 1);
+                    } else {
+                        lambdaReplacement = new StringBuilder(" (");
+                        for (int i = 0; i < singleAbstractMethod.getParameterTypes().size(); i++) {
+                            if (i > 0) {
+                                lambdaReplacement.append(", ");
+                            }
+                            lambdaReplacement.append(singleAbstractMethod.getParameterType(i));
+                            lambdaReplacement.append(" ");
+                            lambdaReplacement.append(singleAbstractMethod.getParameterName(i));
+                        }
+                        lambdaReplacement.append(") ->\n");
+                        // only need to add one indent here, because \n already indents to the same line as before
+                        cu.getCuInfo().getIndentationMode().appendIndent(lambdaReplacement, 1);
+                    }
+                }
+            }
+        }
+
+
+        addParamSnippet(replacementString, paramNames, completion, lambdaReplacement);
+    }
+
+    private void addParamSnippet(String replacementString, List<String> paramNames, CompletionItem completion, StringBuilder lambdaReplacement) {
         if (paramNames.isEmpty()) {
             replacementString += "()";
-            completion.setInsertText(replacementString);
         } else {
             List<String> paramSnippets = new ArrayList<>();
             for (int i = 0; i < paramNames.size(); i++) {
@@ -587,9 +638,13 @@ public class GetCompletions extends UserRequest<CompletionList> {
                 paramSnippets.add("${" + (i + 1) + ":" + paramName + "}");
             }
             replacementString += "(" + String.join(", ", paramSnippets) + ")";
-            completion.setInsertText(replacementString);
             completion.setInsertTextFormat(InsertTextFormat.Snippet);
         }
+        if (lambdaReplacement != null) {
+            replacementString += lambdaReplacement;
+            completion.setInsertTextFormat(InsertTextFormat.Snippet);
+        }
+        completion.setInsertText(replacementString);
     }
 
     private String getFunctionDescriptionShort(FunctionDefinition f) {
@@ -619,7 +674,7 @@ public class GetCompletions extends UserRequest<CompletionList> {
 
 
         List<String> parameterNames = constr.getParameters().stream().map(WParameter::getName).collect(Collectors.toList());
-        addParamSnippet(replacementString, parameterNames, completion);
+        addParamSnippet(replacementString, parameterNames, completion, null);
 
         return completion;
     }

@@ -1,6 +1,7 @@
 package de.peeeq.wurstscript.validation;
 
 import com.google.common.collect.*;
+import de.peeeq.wurstio.utils.FileUtils;
 import de.peeeq.wurstscript.WLogger;
 import de.peeeq.wurstscript.ast.*;
 import de.peeeq.wurstscript.attributes.CofigOverridePackages;
@@ -15,11 +16,12 @@ import de.peeeq.wurstscript.types.*;
 import de.peeeq.wurstscript.utils.Utils;
 import de.peeeq.wurstscript.validation.controlflow.DataflowAnomalyAnalysis;
 import de.peeeq.wurstscript.validation.controlflow.ReturnsAnalysis;
-import fj.P2;
+import io.vavr.Tuple2;
 import org.eclipse.jdt.annotation.Nullable;
 
 import java.util.*;
 import java.util.Map.Entry;
+import java.util.stream.Collectors;
 
 import static de.peeeq.wurstscript.attributes.SmallHelpers.superArgs;
 
@@ -80,6 +82,7 @@ public class WurstValidator {
         checkUnusedImports(toCheck);
         ValidateGlobalsUsage.checkGlobalsUsage(toCheck);
         ValidateClassMemberUsage.checkClassMembers(toCheck);
+        ValidateLocalUsage.checkLocalsUsage(toCheck);
     }
 
     private void checkUnusedImports(List<CompilationUnit> toCheck) {
@@ -215,6 +218,8 @@ public class WurstValidator {
 
     private void check(Element e) {
         try {
+            if (e instanceof Annotation)
+                checkAnnotation((Annotation) e);
             if (e instanceof AstElementWithTypeParameters)
                 checkTypeParameters((AstElementWithTypeParameters) e);
             if (e instanceof AstElementWithNameId)
@@ -339,7 +344,9 @@ public class WurstValidator {
             cde.printStackTrace();
             Element element = cde.getElement();
             String attr = cde.getAttributeName().replaceFirst("^attr", "");
-            WLogger.info(Utils.printElementWithSource(element) + " depends on itself when evaluating attribute " + attr);
+            WLogger.info(Utils.printElementWithSource(Optional.of(element))
+                + " depends on itself when evaluating attribute "
+                + attr);
             WLogger.info(cde);
             throw new CompileError(element.attrSource(),
                     Utils.printElement(element) + " depends on itself when evaluating attribute " + attr);
@@ -623,7 +630,8 @@ public class WurstValidator {
     }
 
     private void checkClosure(ExprClosure e) {
-        if (e.attrExpectedTyp() instanceof WurstTypeCode) {
+        WurstType expectedTyp = e.attrExpectedTypAfterOverloading();
+        if (expectedTyp instanceof WurstTypeCode) {
             // TODO check if no vars are captured
             if (!e.attrCapturedVariables().isEmpty()) {
                 for (Entry<Element, VarDef> elem : e.attrCapturedVariables().entries()) {
@@ -631,13 +639,13 @@ public class WurstValidator {
                             + "' in anonymous function. This is only possible with closures.");
                 }
             }
-        } else if (e.attrExpectedTyp() instanceof WurstTypeUnknown || e.attrExpectedTyp() instanceof WurstTypeClosure) {
+        } else if (expectedTyp instanceof WurstTypeUnknown || expectedTyp instanceof WurstTypeClosure) {
             e.addError("Closures can only be used when a interface or class type is given.");
 
-        } else if (!(e.attrExpectedTyp() instanceof WurstTypeClass
-                || e.attrExpectedTyp() instanceof WurstTypeInterface)) {
+        } else if (!(expectedTyp instanceof WurstTypeClass
+                || expectedTyp instanceof WurstTypeInterface)) {
             e.addError("Closures can only be used when a interface or class type is given, " + "but at this position a "
-                    + e.attrExpectedTyp() + " is expected.");
+                    + expectedTyp + " is expected.");
         }
         e.attrCapturedVariables();
 
@@ -646,8 +654,8 @@ public class WurstValidator {
             new DataflowAnomalyAnalysis(false).execute(block);
         }
 
-        if (e.attrExpectedTyp() instanceof WurstTypeClass) {
-            WurstTypeClass ct = (WurstTypeClass) e.attrExpectedTyp();
+        if (expectedTyp instanceof WurstTypeClass) {
+            WurstTypeClass ct = (WurstTypeClass) expectedTyp;
 
             ClassDef cd = ct.getClassDef();
             if (cd.getConstructors().stream().noneMatch(constr -> constr.getParameters().isEmpty())) {
@@ -706,7 +714,7 @@ public class WurstValidator {
     }
 
     private void checkExprNull(ExprNull e) {
-        if (!Utils.isJassCode(e) && e.attrExpectedTyp() instanceof WurstTypeUnknown) {
+        if (!Utils.isJassCode(Optional.of(e)) && e.attrExpectedTyp() instanceof WurstTypeUnknown) {
             e.addError(
                     "Cannot use 'null' constant here because " + "the compiler cannot infer which kind of null it is.");
         }
@@ -743,7 +751,6 @@ public class WurstValidator {
     }
 
     private void checkStmtSet(StmtSet s) {
-
         NameLink nameLink = s.getUpdatedExpr().attrNameLink();
         if (nameLink == null) {
             s.getUpdatedExpr().addError("Could not find variable " + s.getUpdatedExpr().getVarName() + ".");
@@ -759,7 +766,7 @@ public class WurstValidator {
         WurstType leftType = s.getUpdatedExpr().attrTyp();
         WurstType rightType = s.getRight().attrTyp();
 
-        checkAssignment(Utils.isJassCode(s), s, leftType, rightType);
+        checkAssignment(Utils.isJassCode(Optional.of(s)), s, leftType, rightType);
 
         checkIfAssigningToConstant(s.getUpdatedExpr());
 
@@ -769,7 +776,7 @@ public class WurstValidator {
     private void checkIfNoEffectAssignment(StmtSet s) {
         if (refersToSameVar(s.getUpdatedExpr(), s.getRight())) {
             s.addWarning("The assignment to " + Utils.printElement(s.getUpdatedExpr().attrNameDef())
-                    + "  probably has no effect.");
+                    + " probably has no effect.");
         }
 
     }
@@ -784,7 +791,9 @@ public class WurstValidator {
         if (a instanceof NameRef && b instanceof NameRef) {
             NameRef va = (NameRef) a;
             NameRef vb = (NameRef) b;
-            if (va.attrNameLink() == vb.attrNameLink()
+            NameLink nla = va.attrNameLink();
+            NameLink nlb = vb.attrNameLink();
+            if (nla != null && nlb != null && nla.getDef() == nlb.getDef()
                     && refersToSameVar(va.attrImplicitParameter(), vb.attrImplicitParameter())) {
                 if (va instanceof AstElementWithIndexes && vb instanceof AstElementWithIndexes) {
                     AstElementWithIndexes vai = (AstElementWithIndexes) va;
@@ -919,10 +928,17 @@ public class WurstValidator {
         checkVarName(s, false);
         if (s.getInitialExpr() instanceof Expr) {
             Expr initial = (Expr) s.getInitialExpr();
+            if ((s.getOptTyp() instanceof NoTypeExpr)) {
+                // TODO
+            } else {
+                if (initial instanceof ExprNewObject) {
+                    s.addWarning("Duplicated type information. Use 'var' or 'let' instead.");
+                }
+            }
             WurstType leftType = s.attrTyp();
             WurstType rightType = initial.attrTyp();
 
-            checkAssignment(Utils.isJassCode(s), s, leftType, rightType);
+            checkAssignment(Utils.isJassCode(Optional.of(s)), s, leftType, rightType);
         } else if (s.getInitialExpr() instanceof ArrayInitializer) {
             ArrayInitializer arInit = (ArrayInitializer) s.getInitialExpr();
             checkArrayInit(s, arInit);
@@ -940,7 +956,7 @@ public class WurstValidator {
             if (arT.getDimensions() == 1) {
                 int initialValues = arInit.getValues().size();
                 int size = arT.getSize(0);
-                if (size > 0 && size != initialValues) {
+                if (size >= 0 && size != initialValues) {
                     def.addError("Array variable " + def.getName() + " is an array of size " + size + ", but is initialized with " + initialValues + " values here.");
                 }
 
@@ -963,7 +979,7 @@ public class WurstValidator {
             // (same convention as in Erlang)
             return;
         }
-        if (Utils.isJassCode(s)) {
+        if (Utils.isJassCode(Optional.of(s))) {
             return;
         }
         if (s.getParent() instanceof StmtForRange) {
@@ -980,7 +996,7 @@ public class WurstValidator {
         String varName = s.getName();
 
         if (!isValidVarnameStart(varName) // first letter not lower case
-                && !Utils.isJassCode(s) // not in jass code
+                && !Utils.isJassCode(Optional.of(s)) // not in jass code
                 && !varName.matches("[A-Z0-9_]+") // not a constant
         ) {
             s.addWarning("Variable names should start with a lower case character. (" + varName + ")");
@@ -1045,7 +1061,7 @@ public class WurstValidator {
             Expr initial = (Expr) s.getInitialExpr();
             WurstType leftType = s.attrTyp();
             WurstType rightType = initial.attrTyp();
-            checkAssignment(Utils.isJassCode(s), s, leftType, rightType);
+            checkAssignment(Utils.isJassCode(Optional.of(s)), s, leftType, rightType);
         } else if (s.getInitialExpr() instanceof ArrayInitializer) {
             checkArrayInit(s, (ArrayInitializer) s.getInitialExpr());
         }
@@ -1076,7 +1092,7 @@ public class WurstValidator {
     }
 
     private void checkFunctionName(FunctionDefinition f) {
-        if (!Utils.isJassCode(f)) {
+        if (!Utils.isJassCode(Optional.of(f))) {
             if (!isValidVarnameStart(f.getName())) {
                 f.addWarning("Function names should start with an lower case character.");
             }
@@ -1104,17 +1120,36 @@ public class WurstValidator {
             if (s.attrPreviousStatements().isEmpty()) {
                 if (s.attrListIndex() > 0 || !(stmts.getParent() instanceof TranslatedToImFunction
                         || stmts.getParent() instanceof ExprStatementsBlock)) {
-                    if (Utils.isJassCode(s)) {
+                    if (Utils.isJassCode(Optional.of(s))) {
                         // in jass this is just a warning, because
                         // the shitty code emitted by jasshelper sometimes
                         // contains unreachable code
-                        s.addWarning("unreachable code");
+                        s.addWarning("Unreachable code");
                     } else {
-                        s.addError("unreachable code");
+                        if (mightBeAffectedBySwitchThatCoversAllCases(s)) {
+                            // fow backwards compatibility just use a warning when
+                            // switch statements that handle all cases are involved:
+                            s.addWarning("Unreachable code");
+                        } else {
+                            s.addError("Unreachable code");
+                        }
                     }
                 }
             }
         }
+    }
+
+    private boolean mightBeAffectedBySwitchThatCoversAllCases(WStatement s) {
+        boolean[] containsSwitchAr = { false };
+        s.attrNearestNamedScope().accept(new Element.DefaultVisitor() {
+            @Override
+            public void visit(SwitchStmt switchStmt) {
+                if (switchStmt.calculateHandlesAllCases()) {
+                    containsSwitchAr[0] = true;
+                }
+            }
+        });
+        return containsSwitchAr[0];
     }
 
     private void visit(FuncDef func) {
@@ -1146,9 +1181,12 @@ public class WurstValidator {
         }
         if (!isAbstract) { // not abstract
             checkReturn(f);
+
             if (!f.getSource().getFile().endsWith("common.j")
-                    && !f.getSource().getFile().endsWith("blizzard.j")) {
-                new DataflowAnomalyAnalysis(Utils.isJassCode(f)).execute(f);
+                    && !f.getSource().getFile().endsWith("blizzard.j")
+                    && !f.getSource().getFile().endsWith("war3map.j")
+                    && !FileUtils.getWPosParent(f.getSource()).equals("jassdoc")) {
+                new DataflowAnomalyAnalysis(Utils.isJassCode(Optional.of(f))).execute(f);
             }
         }
     }
@@ -1164,6 +1202,25 @@ public class WurstValidator {
         }
 
         call.attrCallSignature().checkSignatureCompatibility(call.attrFunctionSignature(), funcName, call);
+    }
+
+    private void checkAnnotation(Annotation a) {
+        FuncLink fl = a.attrFuncLink();
+        if (fl != null) {
+            if (a.getArgs().size() < fl.getParameterTypes().size()) {
+                a.addWarning("not enough arguments");
+            } else if (a.getArgs().size() > fl.getParameterTypes().size()) {
+                a.addWarning("too many enough arguments");
+            } else {
+                for (int i = 0; i < a.getArgs().size(); i++) {
+                    WurstType actual = a.getArgs().get(i).attrTyp();
+                    WurstType expected = fl.getParameterType(i);
+                    if (!actual.isSubtypeOf(expected, a)) {
+                        a.getArgs().get(i).addWarning("Expected " + expected + " but found " + actual + ".");
+                    }
+                }
+            }
+        }
     }
 
     private void visit(ExprFunctionCall stmtCall) {
@@ -1479,7 +1536,7 @@ public class WurstValidator {
             return;
         }
 
-        for (P2<TypeParamDef, WurstTypeBoundTypeParam> t : mapping) {
+        for (Tuple2<TypeParamDef, WurstTypeBoundTypeParam> t : mapping) {
             WurstTypeBoundTypeParam boundTyp = t._2();
             WurstType typ = boundTyp.getBaseType();
 
@@ -1581,8 +1638,8 @@ public class WurstValidator {
         if (def != null && def.hasAnnotation("@deprecated")) {
             Annotation annotation = def.getAnnotation("@deprecated");
             String msg = annotation.getAnnotationMessage();
-            msg = (msg == null || msg.isEmpty()) ? "It shouldn't be used and will be removed in the future." : msg.substring(1, msg.length() - 1);
-            trace.addWarning(def.getName() + " is deprecated. " + msg);
+            msg = (msg == null || msg.isEmpty()) ? "It shouldn't be used and will be removed in the future." : msg;
+            trace.addWarning("<" + def.getName() + "> is deprecated. " + msg);
         }
     }
 
@@ -1890,11 +1947,11 @@ public class WurstValidator {
     }
 
     private void checkPackageName(CompilationUnit cu) {
-        if (cu.getPackages().size() == 1 && Utils.isWurstFile(cu.getFile())) {
+        if (cu.getPackages().size() == 1 && Utils.isWurstFile(cu.getCuInfo().getFile())) {
             // only one package in a wurst file
             WPackage p = cu.getPackages().get(0);
-            if (!Utils.fileName(cu.getFile()).equals(p.getName() + ".wurst")
-                    && !Utils.fileName(cu.getFile()).equals(p.getName() + ".jurst")) {
+            if (!Utils.fileName(cu.getCuInfo().getFile()).equals(p.getName() + ".wurst")
+                    && !Utils.fileName(cu.getCuInfo().getFile()).equals(p.getName() + ".jurst")) {
                 p.addError("The file must have the same name as the package " + p.getName());
             }
         }
@@ -1930,7 +1987,7 @@ public class WurstValidator {
                 if (funcs.size() > 1) {
                     StringBuilder alternatives = new StringBuilder();
                     for (NameLink nameLink : funcs) {
-                        alternatives.append("\n - ").append(Utils.printElementWithSource(nameLink.getDef()));
+                        alternatives.append("\n - ").append(Utils.printElementWithSource(Optional.of(nameLink.getDef())));
                     }
                     e.addError("Ambiguous function name: " + exFunc + ". Alternatives are: " + alternatives);
                     return;
@@ -1962,39 +2019,28 @@ public class WurstValidator {
             s.addError("The type " + s.getExpr().attrTyp()
                     + " is not viable as switchtype.\nViable switchtypes: int, string, enum");
         } else {
-            for (SwitchCase c : s.getCases()) {
-                // if ( i > 0 ) {
-                // for( int j = 0; j<i; j++) {
-                // WLogger.info(">>>>>>>>>>>>>>>>"+c.getExprs());
-                // WLogger.info(">>>>>>>>>>>>>>>>"+s.getCases().get(j).getExprs());
-                // if ( c.getExprs().attrN.equals(s.getCases().get(j).getExprs())
-                // )
-                // c.addError("Case " + j + " and " + i + " are the same.");
-                // }
-                // }
-                if (!c.getExpr().attrTyp().isSubtypeOf(s.getExpr().attrTyp(), c)) {
-                    c.addError("The type " + c.getExpr().attrTyp() + " does not match the switchtype "
+            List<Expr> switchExprs = s.getCases().stream()
+                    .flatMap(e -> e.getExpressions().stream())
+                    .collect(Collectors.toList());
+            for (Expr cExpr : switchExprs) {
+                if (!cExpr.attrTyp().isSubtypeOf(s.getExpr().attrTyp(), cExpr)) {
+                    cExpr.addError("The type " + cExpr.attrTyp() + " does not match the switchtype "
                             + s.getExpr().attrTyp() + ".");
                 }
             }
-        }
-        if (s.getExpr().attrTyp() instanceof WurstTypeEnum) {
-            WurstTypeEnum wurstTypeEnum = (WurstTypeEnum) s.getExpr().attrTyp();
-            if (s.getSwitchDefault() instanceof NoDefaultCase)
-                nextMember:for (EnumMember e : wurstTypeEnum.getDef().getMembers()) {
-                    String name = e.getName();
-                    for (SwitchCase c : s.getCases()) {
-                        if (c.getExpr() instanceof NameRef) {
-                            NameRef exprVarAccess = (NameRef) c.getExpr();
-                            if (exprVarAccess.attrNameDef() == e) {
-                                continue nextMember;
-                            }
-                        }
+            for (int i = 0; i < switchExprs.size(); i++) {
+                Expr ei = switchExprs.get(i);
+                for (int j = 0; j < i; j++) {
+                    Expr ej = switchExprs.get(j);
+                    if (ei.structuralEquals(ej)) {
+                        ei.addError("The case " + Utils.prettyPrint(ei) + " is already handled in line " + ej.attrSource().getLine());
+                        return;
                     }
-                    s.addError("Enum member " + name + " from enum " + wurstTypeEnum.getName()
-                            + " not covered in switchstatement and no default found.");
                 }
-
+            }
+        }
+        for (String unhandledCase : s.calculateUnhandledCases()) {
+            s.addError(unhandledCase + " not covered in switchstatement and no default found.");
         }
         if (s.getCases().isEmpty()) {
             s.addError("Switch statement without any cases.");
@@ -2027,8 +2073,8 @@ public class WurstValidator {
     /**
      * checks if func1 can override func2
      */
-    public static boolean canOverride(FuncLink func1, FuncLink func2) {
-        return checkOverride(func1, func2, false) == null;
+    public static boolean canOverride(FuncLink func1, FuncLink func2, boolean allowStaticOverride) {
+        return checkOverride(func1, func2, allowStaticOverride) == null;
     }
 
     /**
@@ -2042,20 +2088,36 @@ public class WurstValidator {
                 return "Static method " + func1.getName() + " cannot override other methods.";
             }
             if (func2.isStatic()) {
-                return "Static " + Utils.printElementWithSource(func2.getDef()) + " cannot be overridden.";
+                return "Static " + Utils.printElementWithSource(Optional.of(func2.getDef())) + " cannot be overridden.";
             }
         } else {
             if (func1.isStatic() && !func2.isStatic()) {
-                return "Static method " + func1.getName() + " cannot override dynamic " + Utils.printElementWithSource(func2.getDef()) + ".";
+                return "Static method "
+                    + func1.getName()
+                    + " cannot override dynamic "
+                    + Utils.printElementWithSource(Optional.of(func2.getDef()))
+                    + ".";
             } else if (!func1.isStatic() && func2.isStatic()) {
-                return "Method " + func1.getName() + " cannot override static " + Utils.printElementWithSource(func2.getDef()) + ".";
+                return "Method "
+                    + func1.getName()
+                    + " cannot override static "
+                    + Utils.printElementWithSource(Optional.of(func2.getDef()))
+                    + ".";
             }
         }
         if (func1.isVarargMethod() && !func2.isVarargMethod()) {
-            return "Vararg method " + func1.getName() + " cannot override non-vararg method " + Utils.printElementWithSource(func2.getDef()) + ".";
+            return "Vararg method "
+                + func1.getName()
+                + " cannot override non-vararg method "
+                + Utils.printElementWithSource(Optional.of(func2.getDef()))
+                + ".";
         }
         if (!func1.isVarargMethod() && func2.isVarargMethod()) {
-            return "Non-vararg method " + func1.getName() + " cannot override vararg method " + Utils.printElementWithSource(func2.getDef()) + ".";
+            return "Non-vararg method "
+                + func1.getName()
+                + " cannot override vararg method "
+                + Utils.printElementWithSource(Optional.of(func2.getDef()))
+                + ".";
         }
         int paramCount2 = func2.getParameterTypes().size();
         int paramCount1 = func1.getParameterTypes().size();
@@ -2070,12 +2132,16 @@ public class WurstValidator {
             WurstType type2 = func2.getParameterType(i);
             if (!type1.isSupertypeOf(type2, func1.getDef())) {
                 return "Parameter " + type1 + " " + func1.getParameterName(i) + " should have type " + type2
-                        + " to override " + Utils.printElementWithSource(func2.getDef()) + ".";
+                        + " to override " + Utils.printElementWithSource(Optional.of(func2.getDef())) + ".";
             }
         }
         // covariant return types
         if (!func1.getReturnType().isSubtypeOf(func2.getReturnType(), func1.getDef())) {
-            return "Return type should be " + func2.getReturnType() + " to override " + Utils.printElementWithSource(func2.getDef()) + ".";
+            return "Return type should be "
+                + func2.getReturnType()
+                + " to override "
+                + Utils.printElementWithSource(Optional.of(func2.getDef()))
+                + ".";
         }
         // no error
         return null;
@@ -2104,7 +2170,7 @@ public class WurstValidator {
                 NameLink l1 = other.get(0);
                 for (int j = 1; j < other.size(); j++) {
                     other.get(j).getDef().addError("An element with name " + name + " already exists: "
-                            + Utils.printElementWithSource(l1.getDef()));
+                            + Utils.printElementWithSource(Optional.of(l1.getDef())));
                 }
             }
             if (funcs.size() <= 1) {
@@ -2116,9 +2182,9 @@ public class WurstValidator {
                     FuncLink f2 = funcs.get(j);
                     if (!distinctFunctions(f1, f2)) {
                         f1.getDef().addError(
-                                "Function already defined : " + Utils.printElementWithSource(f2.getDef()));
+                                "Function already defined : " + Utils.printElementWithSource(Optional.of(f2.getDef())));
                         f2.getDef().addError(
-                                "Function already defined : " + Utils.printElementWithSource(f1.getDef()));
+                                "Function already defined : " + Utils.printElementWithSource(Optional.of(f1.getDef())));
                     }
                 }
             }
@@ -2178,10 +2244,8 @@ public class WurstValidator {
                     v.addError("0-dimensional arrays are not allowed");
                     break;
                 case 1:
-                    if (!v.attrIsDynamicClassMember() && wta.getSize(0) != 0) {
-                        v.addError("Sized arrays are only supported as class members.");
-                    } else if (v.attrIsDynamicClassMember() && wta.getSize(0) == 0) {
-                        v.addError("Array members require a fixed size.");
+                    if (v.attrIsDynamicClassMember() && wta.getSize(0) <= 0) {
+                        v.addError("Array members require a fixed size greater 0.");
                     }
                     break;
                 default:

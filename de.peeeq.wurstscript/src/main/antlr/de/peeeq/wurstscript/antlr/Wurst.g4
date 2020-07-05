@@ -4,7 +4,7 @@ grammar Wurst;
     package de.peeeq.wurstscript.antlr;
 }
 
-compilationUnit : NL* decls+=topLevelDeclaration*;
+compilationUnit : NL* decls+=topLevelDeclaration* EOF;
 
 topLevelDeclaration:
 					 wpackage
@@ -213,7 +213,7 @@ modifier:
 		| annotation
 		;
 
-annotation: name=ANNOTATION (PAREN_LEFT message=STRING PAREN_RIGHT)?;
+annotation: name=ANNOTATION argumentList?;
 
 hotdocComment: HOTDOC_COMMENT;
 
@@ -297,7 +297,7 @@ stmtSwitch:
 		  ;
 			
 switchCase:
-			  'case' expr NL statementsBlock
+			  'case' (caseExpressions+=expr ('|' caseExpressions+=expr)*) NL statementsBlock
 		  ;
 
 switchDefaultCase:

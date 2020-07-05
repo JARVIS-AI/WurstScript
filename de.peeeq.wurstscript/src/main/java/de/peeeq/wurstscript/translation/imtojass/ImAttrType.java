@@ -1,12 +1,11 @@
 package de.peeeq.wurstscript.translation.imtojass;
 
 import com.google.common.collect.Lists;
-import de.peeeq.wurstscript.attributes.CompileError;
 import de.peeeq.wurstscript.jassIm.*;
 import de.peeeq.wurstscript.types.*;
 
+import java.util.ArrayList;
 import java.util.List;
-import java.util.stream.Collectors;
 
 public class ImAttrType {
 
@@ -142,7 +141,14 @@ public class ImAttrType {
 
 
     public static ImType getType(ImMethodCall mc) {
-        return mc.getMethod().getImplementation().getReturnType();
+        ImType returnType = mc.getMethod().getImplementation().getReturnType();
+        returnType = substituteType(returnType, mc.getTypeArguments(), mc.getMethod().getImplementation().getTypeVariables());
+        ImType rt = mc.getReceiver().attrTyp();
+        if (rt instanceof ImClassType) {
+            ImClassType ct = (ImClassType) rt;
+            returnType = substituteType(returnType, ct.getTypeArguments(), ct.getClassDef().getTypeVariables());
+        }
+        return returnType;
     }
 
     public static ImType getType(ImMemberAccess e) {
@@ -156,6 +162,18 @@ public class ImAttrType {
                     typeArgs = receiverType.getTypeArguments();
                 }
                 t = substituteType(t, typeArgs, receiverType.getClassDef().getTypeVariables());
+
+                if (!e.getIndexes().isEmpty()) {
+                    if (t instanceof ImArrayType) {
+                        ImArrayType at = (ImArrayType) t;
+                        t = at.getEntryType();
+                    } else if (t instanceof ImArrayTypeMulti) {
+                        ImArrayTypeMulti at = (ImArrayTypeMulti) t;
+                        t = at.getEntryType();
+                    } else {
+                        throw new RuntimeException("unhandled case: " + t);
+                    }
+                }
                 return t;
             } catch (Exception ex) {
                 throw new RuntimeException("Could not determine type of " + e + " with receiverType " + receiverType, ex);

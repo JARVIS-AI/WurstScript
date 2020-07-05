@@ -22,7 +22,6 @@ import de.peeeq.wurstscript.jassIm.ImProg;
 import de.peeeq.wurstscript.jassinterpreter.TestFailException;
 import de.peeeq.wurstscript.jassinterpreter.TestSuccessException;
 import de.peeeq.wurstscript.jassprinter.JassPrinter;
-import de.peeeq.wurstscript.translation.lua.translation.LuaTranslator;
 import de.peeeq.wurstscript.luaAst.LuaCompilationUnit;
 import de.peeeq.wurstscript.translation.imtranslation.ImTranslator;
 import de.peeeq.wurstscript.utils.Utils;
@@ -39,7 +38,6 @@ import static org.testng.Assert.fail;
 public class WurstScriptTest {
 
     private static final String TEST_OUTPUT_PATH = "./test-output/";
-    private static final boolean testLua = false;
 
     protected boolean testOptimizer() {
         return true;
@@ -60,18 +58,22 @@ public class WurstScriptTest {
         private List<CU> additionalCompilationUnits = new ArrayList<>();
         private boolean stopOnFirstError = true;
         private boolean runCompiletimeFunctions;
+        private boolean testLua = false;
 
         TestConfig(String name) {
             this.name = name;
         }
 
         TestConfig withStdLib() {
-            this.withStdLib = true;
-            return this;
+            return withStdLib(true);
         }
 
         TestConfig withStdLib(boolean b) {
             this.withStdLib = b;
+            if (withStdLib) {
+                // stdlib needs compiletime functions
+                this.runCompiletimeFunctions = true;
+            }
             return this;
         }
 
@@ -203,18 +205,26 @@ public class WurstScriptTest {
 
             testWithInliningAndOptimizationsAndStacktraces(name, executeProg, executeTests, gui, compiler, model, executeProgOnlyAfterTransforms, runArgs);
 
-            if (testLua && !withStdLib) {
+            if (testLua && executeProg && !withStdLib) {
                 // test lua translation
-                compiler.setRunArgs(new RunArgs("-lua"));
-                translateAndTestLua(name, executeProg, gui, model);
+                runArgs = runArgs.with("-lua");
+                compiler.setRunArgs(runArgs);
+                translateAndTestLua(name, executeProg, gui, model, compiler);
             }
 
             return new CompilationResult(model, gui);
         }
 
         public void file(File file) throws IOException {
-            String content = Files.toString(file, StandardCharsets.UTF_8);
-            additionalCompilationUnits.add(new CU(file.getName(), content));
+            try {
+                String content = Files.asCharSource(file, StandardCharsets.UTF_8).read();
+                additionalCompilationUnits.add(new CU(file.getName(), content));
+            } catch (FileNotFoundException e) {
+                throw new FileNotFoundException("Failed to open file "
+                    + file.getAbsolutePath()
+                    + " - can read? "
+                    + file.canRead());
+            }
             run();
         }
 
@@ -244,6 +254,11 @@ public class WurstScriptTest {
 
         public TestConfig runCompiletimeFunctions(boolean b) {
             this.runCompiletimeFunctions = b;
+            return this;
+        }
+
+        public TestConfig testLua(boolean b) {
+            this.testLua = b;
             return this;
         }
     }
@@ -298,6 +313,10 @@ public class WurstScriptTest {
 
     public void testAssertErrorsLines(boolean executeProg, String errorMessage, String... input) {
         test().executeProg(executeProg).expectError(errorMessage).lines(input);
+    }
+
+    public void testAssertErrorsLinesWithStdLib(boolean executeProg, String errorMessage, String... input) {
+        test().withStdLib().executeProg(executeProg).expectError(errorMessage).lines(input);
     }
 
     protected void testAssertOk(String name, boolean executeProg, String prog) {
@@ -367,15 +386,15 @@ public class WurstScriptTest {
         translateAndTest(name, executeProg, executeTests, gui, compiler, model, executeProgOnlyAfterTransforms);
     }
 
-    private void translateAndTestLua(String name, boolean executeProg, WurstGui gui, WurstModel model) {
+    private void translateAndTestLua(String name, boolean executeProg, WurstGui gui, WurstModel model, WurstCompilerJassImpl compiler) {
         try {
             name = name.replaceAll("[^a-zA-Z0-9_]", "_");
 
-            ImTranslator imTranslator = new ImTranslator(model, true);
-            ImProg imProg = imTranslator.translateProg();
+            compiler.translateProgToIm(model);
 
-            LuaTranslator luaTranslator = new LuaTranslator(imProg);
-            LuaCompilationUnit luaCode = luaTranslator.translate();
+            compiler.runCompiletime();
+
+            LuaCompilationUnit luaCode = compiler.transformProgToLua();
             StringBuilder sb = new StringBuilder();
             luaCode.print(sb, 0);
 
@@ -393,9 +412,9 @@ public class WurstScriptTest {
             if (executeProg) {
                 String line;
                 String[] args = {
-                        "lua",
-                        "-l", luaFile.getPath().replace(".lua", ""),
-                        "-e", "main()"
+                    "lua",
+                    "-l", luaFile.getPath().replace(".lua", ""),
+                    "-e", "main()"
                 };
                 Process p = Runtime.getRuntime().exec(args);
                 StringBuilder errors = new StringBuilder();
@@ -427,7 +446,8 @@ public class WurstScriptTest {
                 }
             }
 
-
+        } catch (RuntimeException e) {
+            throw e;
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
@@ -449,7 +469,7 @@ public class WurstScriptTest {
         if (!executeProgOnlyAfterTransforms) {
             // we want to test that the interpreter works correctly before transforming the program in the translation step
             if (executeTests) {
-                executeTests(gui, imProg);
+                executeTests(gui, compiler.getImTranslator(), imProg);
             }
             if (executeProg) {
                 executeImProg(gui, imProg);
@@ -464,7 +484,7 @@ public class WurstScriptTest {
         }
 
         if (executeTests) {
-            executeTests(gui, imProg);
+            executeTests(gui, compiler.getImTranslator(), imProg);
         }
         if (executeProg) {
             executeImProg(gui, imProg);
@@ -533,7 +553,7 @@ public class WurstScriptTest {
     private void executeImProg(WurstGui gui, ImProg imProg) throws TestFailException {
         try {
             // run the interpreter on the intermediate language
-            ILInterpreter interpreter = new ILInterpreter(imProg, gui, null, false);
+            ILInterpreter interpreter = new ILInterpreter(imProg, gui, Optional.empty(), false);
             interpreter.addNativeProvider(new ReflectionNativeProvider(interpreter));
             interpreter.executeFunction("main", null);
         } catch (TestSuccessException e) {
@@ -556,9 +576,9 @@ public class WurstScriptTest {
         throw new Error("Succeed function not called");
     }
 
-    private void executeTests(WurstGui gui, ImProg imProg) {
-        RunTests runTests = new RunTests(null, 0, 0);
-        RunTests.TestResult res = runTests.runTests(imProg, null, null);
+    private void executeTests(WurstGui gui, ImTranslator translator, ImProg imProg) {
+        RunTests runTests = new RunTests(Optional.empty(), 0, 0, Optional.empty());
+        RunTests.TestResult res = runTests.runTests(translator, imProg, Optional.empty(), Optional.empty());
         if (res.getPassedTests() < res.getTotalTests()) {
             throw new Error("tests failed: " + res.getPassedTests() + " / " + res.getTotalTests() + "\n" +
                     gui.getErrors());

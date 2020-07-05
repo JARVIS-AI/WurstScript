@@ -5,6 +5,7 @@ buildscript {
     dependencies {
         classpath 'de.undercouch:gradle-download-task:3.2.0'
         classpath 'org.kt3k.gradle.plugin:coveralls-gradle-plugin:1.0.2'
+        classpath 'org.eclipse.jgit:org.eclipse.jgit:5.7.+'
     }
 }
 
@@ -19,16 +20,26 @@ plugins {
 }
 
 import de.undercouch.gradle.tasks.download.Download
+import org.eclipse.jgit.api.Git
+import org.eclipse.jgit.internal.storage.file.FileRepository
+import org.eclipse.jgit.lib.Constants
+import org.eclipse.jgit.lib.ObjectId
 
 import java.util.regex.Matcher
 import java.util.regex.Pattern
 
 
 mainClassName = "de.peeeq.wurstio.Main"
-version = "1.8.0.0"
+version = "1.8.1.0"
 
-sourceCompatibility = '1.8'
-targetCompatibility = '1.8'
+allprojects {
+    sourceCompatibility = '1.8'
+    targetCompatibility = '1.8'
+}
+
+jacoco {
+    toolVersion = "0.8.5"
+}
 
 jacocoTestReport {
     reports {
@@ -70,7 +81,7 @@ dependencies {
     antlr "org.antlr:antlr4:4.7"
 
     // tool for generating AST-classes
-    compileOnly 'com.github.peterzeller:abstractsyntaxgen:59168ba9d61d89c775a53d54b3b83a99f48a585b'
+    compileOnly 'com.github.peterzeller:abstractsyntaxgen:3510802026'
 
     // JUnit for testing
     testCompile group: 'org.testng', name: 'testng', version: '6.14.3'
@@ -79,11 +90,11 @@ dependencies {
     // Google guava
     compile 'com.google.guava:guava:26.0-jre'
 
-    // Functional data structures:
-    compile group: 'org.functionaljava', name: 'functionaljava', version: '4.8.1'
+    // Better functional data structures:
+    compile 'io.vavr:vavr:1.0.0-alpha-3'
 
     // Support for the vscode language server protocol
-    compile group: 'org.eclipse.lsp4j', name: 'org.eclipse.lsp4j', version: '0.5.0'
+    compile group: 'org.eclipse.lsp4j', name: 'org.eclipse.lsp4j', version: '0.7.0'
 
     // @Nullable annotations
     compile group: 'org.eclipse.jdt', name: 'org.eclipse.jdt.annotation', version: '2.1.0'
@@ -98,13 +109,13 @@ dependencies {
     compile group: 'net.sourceforge.jchardet', name: 'jchardet', version: '1.0'
 
     // Crigges' jmpq
-    compile group: 'com.github.inwc3', name: 'jmpq3', version: '1.7.7'
+    compile 'com.github.inwc3:jmpq3:1.7.14'
 
     // Water's wc3 libs
-    compile 'com.github.inwc3:wc3libs:7fe3b95163'
+    compile 'com.github.inwc3:wc3libs:fd4b2fd5aa'
 
     // The setup tool for wurst.build handling
-    compile 'com.github.wurstscript:wurstsetup:cc208dcc86'
+    compile 'com.github.wurstscript:wurstsetup:e038293d07'
 
     compile group: 'org.slf4j', name: 'slf4j-api', version: '1.7.25'
     compile group: 'ch.qos.logback', name: 'logback-classic', version: '1.2.3'
@@ -121,7 +132,6 @@ configurations.all {
 task genAst {
     description = 'Compile ast specifications'
     fileTree(dir: 'parserspec', include: '**/*.parseq').each { file ->
-
         Pattern PACKAGE_PATTERN = Pattern.compile("package\\s+(\\S+)\\s*;");
         String fileContents = file.text
 
@@ -150,34 +160,24 @@ task genAst {
 task versionInfoFile {
     description "Generates a file CompileTimeInfo.java with version number etc."
 
+    String gitRevision = "unknown-version"
+    String gitRevisionlong = "unknown-version"
+
+    Git git = Git.open(new File(rootProject.projectDir, '..'))
+    ObjectId head = git.getRepository().resolve(Constants.HEAD)
+
+    gitRevision = head.abbreviate(8).name()
+    gitRevisionlong = head.getName()
+
+    String wurstVersion = "${version}-${gitRevision}"
+    inputs.property("wurstVersion", wurstVersion)
+
+    def dir = new File('./src-gen/de/peeeq/wurstscript/')
+    def f = new File(dir, 'CompileTimeInfo.java')
+    outputs.file(f)
+
     doLast {
-        def dir = new File('./src-gen/de/peeeq/wurstscript/')
         dir.mkdirs()
-        def f = new File(dir, 'CompileTimeInfo.java')
-
-        String gitRevision = "unknown-version"
-        String gitRevisionlong = "unknown-version"
-
-        new ByteArrayOutputStream().withStream { os ->
-            def result = exec {
-                executable = 'git'
-                args = ['describe', '--tags', '--always']
-                standardOutput = os
-            }
-            gitRevision = os.toString().trim()
-        }
-
-        new ByteArrayOutputStream().withStream { os ->
-            def result = exec {
-                executable = 'git'
-                args = ['describe', '--tags', '--always', '--abbrev=0']
-                standardOutput = os
-            }
-            gitRevisionlong = os.toString().trim()
-        }
-
-        String wurstVersion = "${version}-${gitRevision}"
-
 
         String currentTime = new Date().format("yyyy/MM/dd KK:mm:ss")
 
@@ -220,11 +220,6 @@ clean.doFirst {
     delete genDir
 }
 
-//task wrapper(type: Wrapper) {
-//    gradleVersion = '2.12'
-//}
-
-
 
 apply plugin: 'de.undercouch.download'
 
@@ -239,6 +234,3 @@ task downloadAndUnzipFile(dependsOn: downloadZipFile, type: Copy) {
 }
 
 apply from: 'deploy.gradle'
-
-
-
